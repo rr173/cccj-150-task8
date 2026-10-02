@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>交换包交付回执中继</title>
+<style>
+:root{
+  --bg:#0f1620; --panel:#16202c; --panel2:#1c2836; --line:#2b3a4d;
+  --txt:#dce6f2; --muted:#8aa0b8; --accent:#4aa8ff; --ok:#35c46a;
+  --warn:#f5a623; --bad:#ef5b5b; --purple:#a87bff; --teal:#2fd1c1;
+}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5 "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  background:var(--bg);color:var(--txt)}
+header{display:flex;align-items:center;gap:16px;padding:12px 20px;
+  background:linear-gradient(90deg,#102236,#16202c);border-bottom:1px solid var(--line)}
+header .brand{font-size:17px;font-weight:600}
+header .sub{color:var(--muted);font-size:12px}
+header a{margin-left:auto;color:var(--accent);text-decoration:none;font-size:13px}
+.layout{display:grid;grid-template-columns:340px 1fr 380px;gap:12px;padding:12px;
+  align-items:start;min-height:calc(100vh - 56px)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  overflow:hidden}
+.panel h2{margin:0;padding:10px 14px;font-size:13px;letter-spacing:1px;color:var(--muted);
+  text-transform:uppercase;border-bottom:1px solid var(--line);
+  display:flex;align-items:center;gap:8px}
+.panel h2 .count{background:var(--panel2);border-radius:10px;padding:0 8px;color:var(--txt)}
+.body{padding:12px 14px;max-height:calc(100vh - 120px);overflow:auto}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
+  border-radius:6px;padding:6px 12px;cursor:pointer;font-size:13px}
+button:hover{border-color:var(--accent)}
+button.primary{background:#1c4f7e;border-color:#2d73b0}
+button.primary:hover{background:#245f97}
+button.danger{border-color:#7e3535;color:#ffb0b0}
+button.warn{border-color:#8a6420;color:#ffd08a}
+button:disabled{opacity:.45;cursor:not-allowed}
+input,select,textarea{background:#0e1620;border:1px solid var(--line);color:var(--txt);
+  border-radius:6px;padding:6px 8px;font-size:13px;font-family:inherit}
+input{width:100%}
+label{font-size:12px;color:var(--muted)}
+.field{margin:8px 0}
+.field label{display:block;margin-bottom:3px}
+.hint{color:var(--muted);font-size:12px}
+.session{padding:10px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+.session:hover{background:var(--panel2)}
+.session.active{background:#17324a;box-shadow:inset 3px 0 0 var(--accent)}
+.session .top{display:flex;justify-content:space-between;gap:8px;align-items:center}
+.session .sid{font-weight:600;font-family:ui-monospace,Menlo,monospace;font-size:13px}
+.tag{font-size:11px;padding:1px 7px;border-radius:10px;border:1px solid var(--line);
+  color:var(--muted);white-space:nowrap}
+.tag.ok{color:var(--ok);border-color:#246040}
+.tag.bad{color:var(--bad);border-color:#7e3535;background:#2a1717}
+.tag.warn{color:var(--warn);border-color:#7a5a1f}
+.tag.purple{color:var(--purple);border-color:#4c3a78}
+.tag.teal{color:var(--teal);border-color:#1f625c}
+.wm{font-size:12px;color:var(--muted);margin-top:3px}
+.dots{display:flex;gap:3px;margin-top:6px;flex-wrap:wrap}
+.dot{width:13px;height:13px;border-radius:3px;background:#263445;border:1px solid #34475e}
+.dot.ok{background:#1f7a45;border-color:#2a9e5c}
+.dot.wait{background:#7a5a1f;border-color:#a87c22}
+.dot.bad{background:#7e2b2b;border-color:#b23838}
+.kv{display:grid;grid-template-columns:110px 1fr;gap:4px 10px;margin:6px 0;font-size:13px}
+.kv .k{color:var(--muted)}
+.kv .v{font-family:ui-monospace,Menlo,monospace;word-break:break-all}
+.section-title{margin:16px 0 6px;font-size:12px;color:var(--muted);
+  text-transform:uppercase;letter-spacing:1px;border-bottom:1px dashed var(--line);padding-bottom:4px}
+.ev{display:flex;gap:8px;align-items:flex-start;padding:6px 8px;border-radius:6px;
+  background:var(--panel2);margin-bottom:5px;font-size:12px}
+.ev .rev{font-family:ui-monospace,Menlo,monospace;color:var(--accent);min-width:26px}
+.ev .etype{font-weight:600;min-width:130px}
+.ev .hash{color:var(--muted);font-family:ui-monospace,Menlo,monospace;font-size:11px}
+pre{background:#0b121b;border:1px solid var(--line);border-radius:6px;padding:8px;
+  font-size:11px;overflow:auto;max-height:240px;color:#bcd}
+.toast{position:fixed;right:18px;bottom:18px;max-width:420px;z-index:99;display:flex;
+  flex-direction:column;gap:8px}
+.toast .t{background:var(--panel2);border:1px solid var(--line);border-left:4px solid var(--accent);
+  border-radius:6px;padding:9px 12px;font-size:12px;box-shadow:0 6px 24px #0009}
+.toast .t.ok{border-left-color:var(--ok)}
+.toast .t.bad{border-left-color:var(--bad)}
+.toast .t.warn{border-left-color:var(--warn)}
+.receipt{border:1px solid var(--line);border-radius:8px;padding:9px 10px;margin-bottom:8px;background:var(--panel2)}
+.receipt .rk{font-family:ui-monospace,Menlo,monospace;font-weight:600}
+.pillbtn{font-size:11px;padding:3px 8px}
+.tabs{display:flex;gap:4px;margin-bottom:10px}
+.tabs button{flex:0 auto}
+.tabs button.on{background:#1c4f7e;border-color:#2d73b0}
+details summary{cursor:pointer;color:var(--muted);font-size:12px;margin:4px 0}
+.muted{color:var(--muted)}
+.small{font-size:12px}
+.divider{height:1px;background:var(--line);margin:12px 0}
+.badge-num{background:var(--bad);border-radius:9px;color:#fff;font-size:10px;padding:0 5px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.spin{opacity:.5;pointer-events:none}
+code{background:#0b121b;padding:1px 5px;border-radius:4px;font-size:11px}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <div class="brand">📮 交换包交付回执中继 <span class="sub">Delivery Receipt Relay</span></div>
+  </div>
+  <span class="hint">连续水位 · 哈希链 · 会话隔离 · Ed25519 离线可核验回执</span>
+  <a href="/">← 返回地籍平台</a>
+</header>
+
+<div class="layout">
+  <!-- ================= 左：会话列表 ================= -->
+  <div class="panel">
+    <h2>会话水位 <span class="count" id="sess-count">0</span>
+      <button class="pillbtn" style="margin-left:auto" onclick="loadAll()">刷新</button>
+    </h2>
+    <div class="body">
+      <div class="field">
+        <label>按发送方过滤（留空 = 全部）</label>
+        <input id="filter-sender" placeholder="如 demo-site" oninput="renderSessions()">
+      </div>
+      <div class="row" style="margin:6px 0 10px">
+        <button class="pillbtn warn" onclick="demoConflict()">制造隔离</button>
+        <button class="pillbtn primary" onclick="demoHealthy()">乱序缺口演示</button>
+      </div>
+      <div id="session-list"></div>
+    </div>
+  </div>
+
+  <!-- ================= 中：会话详情 ================= -->
+  <div class="panel">
+    <h2 id="detail-title">会话详情</h2>
+    <div class="body" id="detail-body">
+      <p class="muted">从左侧选择一个会话；或先点击「乱序缺口演示」/「制造隔离」生成演示数据。</p>
+      <div class="divider"></div>
+      <div class="section-title">一键演示（模拟快照接收服务推送审计事件）</div>
+      <div class="row">
+        <button class="primary" onclick="demoHealthy()">① 乱序推送（rev 1、3，缺 rev 2）</button>
+        <button onclick="demoFillGap()">② 补传缺口 rev 2</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <button onclick="demoFinish()">③ 批量重放 rev 4-6（含移交/终检）</button>
+        <button class="danger" onclick="demoConflict()">④ 制造同序号异内容（隔离）</button>
+        <button class="warn" onclick="demoConflictRecover()">⑤ 撤回误版 + 解除隔离恢复</button>
+      </div>
+      <p class="hint" style="margin-top:6px">
+        ④ 中另一个会话 <code>PKG-HEALTHY</code> 会保持健康，证明隔离不跨会话串写；
+        所有事件都由演示发送方私钥做 Ed25519 签章后走与生产相同的推送管线。
+      </p>
+    </div>
+  </div>
+
+  <!-- ================= 右：回执与清理 ================= -->
+  <div class="panel">
+    <h2>签名回执包 / 清理授权</h2>
+    <div class="body">
+      <div class="tabs">
+        <button id="tab-export" class="on" onclick="switchTab('export')">导出/下载</button>
+        <button id="tab-upload" onclick="switchTab('upload')">上传核验</button>
+        <button id="tab-cleanup" onclick="switchTab('cleanup')">清理授权</button>
+        <button id="tab-lease" onclick="switchTab('lease')">领取租约</button>
+      </div>
+
+      <div id="pane-export">
+        <div class="field"><label>导出请求键 request_key（同键重放得原包）</label>
+          <input id="rcp-key" value="REQ-DEMO-1"></div>
+        <div class="grid2">
+          <div class="field"><label>接收机构</label>
+            <input id="rcp-inst" value="DEMO-IN"></div>
+          <div class="field"><label>发送方</label>
+            <input id="rcp-sender" value="demo-site"></div>
+        </div>
+        <div class="grid2">
+          <div class="field"><label>有效期 TTL（秒）</label>
+            <input id="rcp-ttl" type="number" value="86400"></div>
+          <div class="field"><label>指定会话（逗号分隔，留空=全部）</label>
+            <input id="rcp-sessions" placeholder="PKG-HAPPY"></div>
+        </div>
+        <button class="primary" style="width:100%" onclick="exportReceipt(false)">签发回执包</button>
+        <button style="width:100%;margin-top:6px" onclick="exportReceipt(true)">同键重放（必须返回原包）</button>
+        <div class="section-title">已签发回执</div>
+        <div id="receipt-list"></div>
+      </div>
+
+      <div id="pane-upload" hidden>
+        <p class="hint">上传一个 <code>.receipt.json</code> 文件，浏览器内调用核验接口
+          （重算机构签章、事件哈希链、有效期、水位一致性）——独立核验器
+          <code>python -m app.relay.verifier 包.json</code> 完全离线做同样的事。</p>
+        <input type="file" id="upload-file" accept=".json,application/json">
+        <div style="margin-top:8px"><button onclick="verifyUploaded()">核验上传包</button></div>
+        <div class="field" style="margin-top:10px"><label>或直接粘贴回执包 JSON</label>
+          <textarea id="upload-paste" rows="6" style="width:100%"
+            placeholder='{"body":{...},"signature":...,"institution_public_key":...}'></textarea></div>
+        <button onclick="verifyPasted()">核验粘贴内容</button>
+        <pre id="verify-out" hidden></pre>
+      </div>
+
+      <div id="pane-cleanup" hidden>
+        <p class="hint">发送方凭回执清理本地事件：只有<b>已确认水位之前且仍与摘要一致</b>
+          才授权；过期回执或本地事件后来变化一律拒绝。</p>
+        <div class="field"><label>回执包（从「导出/下载」签发后会自动带入；也可粘贴）</label>
+          <textarea id="cleanup-pkg" rows="5" style="width:100%"></textarea></div>
+        <div class="field"><label>待清理本地事件 JSON（revision + event_hash）</label>
+          <textarea id="cleanup-local" rows="4" style="width:100%"></textarea></div>
+        <div class="row">
+          <button class="primary" onclick="cleanupAuth()">请求清理授权</button>
+          <button onclick="fillLocalFromCurrent()">填入当前会话全部事件</button>
+          <button class="warn" onclick="tamperLocal()">把第 2 个事件哈希改成 ff…（模拟事后变化）</button>
+        </div>
+        <pre id="cleanup-out" hidden></pre>
+      </div>
+
+      <div id="pane-lease" hidden>
+        <p class="hint">两个工作实例并发领取同一会话：持久租约保证只有一个实例处理；
+          TTL 过期后可安全接管；租约粒度是单会话，不影响其他会话。</p>
+        <div class="grid2">
+          <div class="field"><label>工作实例 ID</label>
+            <input id="lease-worker" value="worker-1"></div>
+          <div class="field"><label>会话 ID</label>
+            <input id="lease-session" value="PKG-HAPPY"></div>
+        </div>
+        <div class="field"><label>发送方（可留空）</label>
+          <input id="lease-sender" value="demo-site"></div>
+        <div class="row">
+          <button class="primary" onclick="claimLease()">领取</button>
+          <button onclick="releaseLease()">释放</button>
+          <button class="warn" onclick="claimLease('worker-2')">模拟 worker-2 并发领取</button>
+        </div>
+        <pre id="lease-out" hidden></pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = "/api/relay";
+let sessions = [], currentKey = null, lastPackage = null;
+
+function toast(msg, kind="info"){
+  const box = document.getElementById("toast");
+  const el = document.createElement("div");
+  el.className = "t " + kind;
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(()=>el.remove(), 4200);
+}
+async function api(path, opts={}){
+  const r = await fetch(API+path, {
+    headers:{"Content-Type":"application/json"}, ...opts,
+    body: opts.body ? JSON.stringify(opts.body) : undefined});
+  let data = null;
+  try { data = await r.json(); } catch(e){ data = {}; }
+  if(!r.ok) throw Object.assign(new Error(data.message||r.statusText),
+    {status:r.status, data});
+  return data;
+}
+function esc(s){ return String(s??"").replace(/[&<>]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function shortH(h){ return h ? h.slice(0,10)+"…" : "—"; }
+
+async function loadAll(){
+  await Promise.all([loadSessions(), loadReceipts()]);
+}
+async function loadSessions(){
+  const q = document.getElementById("filter-sender").value.trim();
+  const data = await api("/sessions"+(q?("?sender_id="+encodeURIComponent(q)):""));
+  sessions = data.sessions;
+  renderSessions();
+  if(currentKey) renderDetail();
+}
+function renderSessions(){
+  const f = document.getElementById("filter-sender").value.trim();
+  document.getElementById("sess-count").textContent = sessions.length;
+  const el = document.getElementById("session-list");
+  if(!sessions.length){ el.innerHTML = '<p class="muted small">暂无会话</p>'; return; }
+  el.innerHTML = sessions.map(s=>{
+    const key = s.sender_id+"|"+s.session_id;
+    const active = key===currentKey ? "active":"";
+    let tag = s.quarantined
+      ? '<span class="tag bad">已隔离</span>'
+      : (s.state==="IMPORTED" ? '<span class="tag teal">IMPORTED</span>'
+         : '<span class="tag ok">健康</span>');
+    const lease = s.lease_owner ? `<span class="tag purple">租约:${esc(s.lease_owner)}</span>`:"";
+    const total = Math.max(s.watermark, 0);
+    let dots="";
+    for(let i=1;i<=Math.max(total, s.watermark);i++)
+      dots += `<span class="dot ok" title="rev ${i} 已确认"></span>`;
+    return `<div class="session ${active}" onclick="selectSession('${s.sender_id}','${s.session_id}')">
+      <div class="top">
+        <span class="sid">${esc(s.session_id)}</span>${tag}${lease}
+      </div>
+      <div class="wm">${esc(s.sender_id)} · 水位 <b>${s.watermark}</b>${s.state?(" · "+esc(s.state)):""}</div>
+      ${dots?`<div class="dots">${dots}</div>`:""}
+      ${s.quarantine_reason?`<div class="wm" style="color:var(--bad)">${esc(s.quarantine_reason)}</div>`:""}
+    </div>`;
+  }).join("");
+}
+function selectSession(sender, sid){
+  currentKey = sender+"|"+sid;
+  document.getElementById("lease-session").value = sid;
+  document.getElementById("lease-sender").value = sender;
+  renderSessions(); renderDetail();
+}
+
+async function renderDetail(){
+  if(!currentKey) return;
+  const [sender, sid] = currentKey.split("|");
+  let d;
+  try { d = await api(`/sessions/${encodeURIComponent(sender)}/${encodeURIComponent(sid)}`); }
+  catch(e){ toast("加载详情失败: "+e.message,"bad"); return; }
+  document.getElementById("detail-title").textContent = "会话详情 · "+sid;
+  const q = d.quarantine || {};
+  const dots = [];
+  const maxRev = Math.max(d.watermark, ...d.pending_revisions.map(p=>p.revision), 0);
+  for(let i=1;i<=maxRev;i++){
+    if(i<=d.watermark) dots.push(`<span class="dot ok" title="rev ${i} 已确认"></span>`);
+    else {
+      const p = d.pending_revisions.find(x=>x.revision===i);
+      if(p) dots.push(`<span class="dot wait" title="rev ${i} 已收到但等待前序（变体 ${p.variants}）"></span>`);
+      else dots.push(`<span class="dot" title="rev ${i} 缺失"></span>`);
+    }
+  }
+  const evs = d.confirmed_events.map(e=>`
+    <div class="ev">
+      <span class="rev">#${e.revision}</span>
+      <span class="etype">${esc(e.event_type)}</span>
+      <span class="tag ${e.state==="IMPORTED"?"teal":""}">v${e.session_version} · ${esc(e.state)}</span>
+      <span class="hash">${shortH(e.event_hash)} ← ${shortH(e.prev_event_hash)}</span>
+    </div>`).join("");
+  const rej = d.confirmed_events.filter(e=>/REJECTED/.test(e.event_type));
+  document.getElementById("detail-body").innerHTML = `
+    <div class="kv">
+      <span class="k">发送方</span><span class="v">${esc(sender)}</span>
+      <span class="k">连续水位</span><span class="v"><b style="color:var(--ok)">${d.watermark}</b> / 状态 ${esc(d.state||"—")}${d.closed?' · <span class="tag teal">已闭合</span>':""}</span>
+      <span class="k">隔离状态</span><span class="v">${d.quarantined?'<b style="color:var(--bad)">已隔离</b>':'正常'}</span>
+      <span class="k">处理租约</span><span class="v">${d.lease?esc(d.lease.owner)+" @ "+esc(d.lease.at):"无"}</span>
+    </div>
+    <div class="dots" style="margin:6px 0 10px">${dots.join("")}
+      <span class="hint" style="margin-left:8px">绿=已确认 黄=已到等前序 灰=缺口</span></div>
+    ${d.missing_revisions.length?`<p class="small" style="color:var(--warn)">缺口修订号：${d.missing_revisions.join(", ")||"（无直接缺口，等待乱序事件的前序）"}</p>`:""}
+    ${d.quarantined?`
+      <div class="section-title" style="color:var(--bad)">隔离原因与可定位差异</div>
+      <div class="kv">
+        <span class="k">原因码</span><span class="v" style="color:var(--bad)">${esc(d.quarantine_reason)}</span>
+      </div>
+      <pre>${esc(JSON.stringify(d.quarantine_detail,null,2))}</pre>
+      <details ${d.quarantine_detail&&d.quarantine_detail.distinct_hashes?"open":""}>
+        <summary>解除隔离 / 撤回误版恢复</summary>
+        <p class="hint">同序号异内容时，撤回错误版本的原始事件（已确认链上事件不可撤回），
+          再解除隔离，链会从正确版本继续推进。</p>
+        <div id="discard-box"></div>
+        <div class="field"><label>处理说明</label><input id="release-note" value="页面演示：确认差异后撤回误版"></div>
+        <div class="row">
+          <button class="warn" onclick="releaseQuarantine(false)">仅解除隔离（不撤回，将重新隔离）</button>
+          <button class="primary" onclick="releaseQuarantine(true)">撤回勾选误版并解除</button>
+        </div>
+      </details>`:""}
+    <div class="section-title">已确认事件哈希链（${d.confirmed_events.length}）</div>
+    ${evs||'<p class="muted small">尚无已确认事件</p>'}
+    ${rej.length?`<details><summary>拒绝明细（${rej.length}）</summary><pre>${esc(JSON.stringify(rej.map(e=>({revision:e.revision,event_type:e.event_type,detail:e.detail_json})),null,2))}</pre></details>`:""}
+    ${d.pending_revisions.length?`<div class="section-title">水位后已收到（待前序/隔离中）</div><pre>${esc(JSON.stringify(d.pending_revisions,null,2))}</pre>`:""}
+    <div class="divider"></div>
+    <div class="section-title">一键演示（模拟快照接收服务推送审计事件）</div>
+    <div class="row">
+      <button class="primary" onclick="demoHealthy()">① 乱序推送（rev 1、3，缺 rev 2）</button>
+      <button onclick="demoFillGap()">② 补传缺口 rev 2</button>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <button onclick="demoFinish()">③ 批量重放 rev 4-6（含移交/终检）</button>
+      <button class="danger" onclick="demoConflict()">④ 制造同序号异内容（隔离）</button>
+      <button class="warn" onclick="demoConflictRecover()">⑤ 撤回误版 + 解除隔离恢复</button>
+    </div>`;
+  // 勾选框：列出该会话可撤回的（未确认）异内容哈希
+  if(d.quarantine_detail && d.quarantine_detail.distinct_hashes){
+    document.getElementById("discard-box").innerHTML =
+      d.quarantine_detail.distinct_hashes.map((h,i)=>
+        `<label style="display:flex;gap:6px;align-items:center;color:var(--txt);font-family:ui-monospace,Menlo,monospace;font-size:11px;margin:3px 0">
+          <input type="checkbox" class="discard-h" value="${esc(h)}" ${i===0?"checked":""} style="width:auto">
+          ${shortH(h)}${i===0?' <span class="hint">（通常保留正确版本、撤回较早的误版——按实际差异勾选）</span>':""}</label>`).join("");
+  }
+}
+
+async function releaseQuarantine(withDiscard){
+  const [sender, sid] = currentKey.split("|");
+  let discard = {};
+  if(withDiscard){
+    const checked = [...document.querySelectorAll(".discard-h:checked")].map(x=>x.value);
+    const rev = (await api(`/sessions/${encodeURIComponent(sender)}/${encodeURIComponent(sid)}`)).quarantine_detail.at_revision;
+    if(checked.length) discard = {[rev]: checked};
+  }
+  try{
+    const r = await api(`/sessions/${encodeURIComponent(sender)}/${encodeURIComponent(sid)}/release-quarantine`,
+      {method:"POST", body:{note:document.getElementById("release-note")?.value||"页面解除",
+        discard_event_hashes: discard}});
+    toast(`已解除：水位 ${r.watermark}${r.quarantined?"，但重新校验仍隔离（需撤回异内容）":"，恢复推进"}`,
+      r.quarantined?"warn":"ok");
+    await loadSessions(); await renderDetail();
+  }catch(e){ toast("解除失败: "+e.message,"bad"); }
+}
+
+// ---------------- 演示动作 ----------------
+async function demoPost(path, body={}){
+  try { return await api(path, {method:"POST", body}); }
+  catch(e){ toast("演示失败: "+e.message+" "+JSON.stringify(e.data||{}),"bad"); throw e; }
+}
+async function demoHealthy(){
+  await demoPost("/demo/happy-init",{});
+  toast("已乱序推送 rev 1、3：rev3 等待缺口 rev2（WAITING，不隔离）","warn");
+  currentKey="demo-site|PKG-HAPPY";
+  await loadSessions(); await renderDetail();
+}
+async function demoFillGap(){
+  const r = await demoPost("/demo/happy-fill-gap",{revision:2});
+  toast("补传 rev2：水位连续推进到 3（乱序的 rev3 一并确认）","ok");
+  currentKey="demo-site|PKG-HAPPY";
+  await loadSessions(); await renderDetail();
+}
+async function demoFinish(){
+  await demoPost("/demo/happy-finish",{});
+  toast("批量重放 rev4-6：移交版本跃迁合法，终检 IMPORTED 闭合","ok");
+  currentKey="demo-site|PKG-HAPPY";
+  await loadSessions(); await renderDetail();
+}
+async function demoConflict(){
+  const r = await demoPost("/demo/conflict-init",{});
+  toast("同序号异内容 → PKG-CONFLICT 已隔离；PKG-HEALTHY 不受影响","bad");
+  currentKey="demo-site|PKG-CONFLICT";
+  await loadSessions(); await renderDetail();
+}
+async function demoConflictRecover(){
+  const r = await demoPost("/demo/conflict-recover",{});
+  toast(`撤回 ${r.discard_event_hashes.length} 个误版并解除隔离，续链确认至水位 ${r.release.watermark}`,"ok");
+  currentKey="demo-site|PKG-CONFLICT";
+  await loadSessions(); await renderDetail();
+}
+
+// ---------------- 回执 ----------------
+function switchTab(name){
+  ["export","upload","cleanup","lease"].forEach(t=>{
+    document.getElementById("pane-"+t).hidden = t!==name;
+    document.getElementById("tab-"+t).classList.toggle("on", t===name);
+  });
+}
+async function exportReceipt(replay){
+  const key=document.getElementById("rcp-key").value.trim();
+  const body={request_key:key,
+    institution_code:document.getElementById("rcp-inst").value.trim(),
+    sender_id:document.getElementById("rcp-sender").value.trim(),
+    ttl_seconds:Number(document.getElementById("rcp-ttl").value)};
+  const s=document.getElementById("rcp-sessions").value.trim();
+  if(s) body.session_ids=s.split(",").map(x=>x.trim());
+  try{
+    const r=await api("/receipts",{method:"POST",body});
+    lastPackage=r.package;
+    document.getElementById("cleanup-pkg").value=JSON.stringify(r.package,null,2);
+    toast((r.replayed?"重放命中原包（字节完全一致）":"已签发新回执包")+
+      ` · ${r.package.body.sessions.length} 个会话`,"ok");
+    download(JSON.stringify(r.package,null,2),
+      `${key}.receipt.json`);
+    await loadReceipts();
+  }catch(e){ toast("导出失败: "+e.message,"bad"); }
+}
+function download(text,name){
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([text],{type:"application/json"}));
+  a.download=name; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 5000);
+}
+async function loadReceipts(){
+  const sender=document.getElementById("rcp-sender").value.trim();
+  const data=await api("/receipts"+(sender?("?sender_id="+encodeURIComponent(sender)):""));
+  document.getElementById("receipt-list").innerHTML = data.receipts.map(r=>`
+    <div class="receipt">
+      <div class="row" style="justify-content:space-between">
+        <span class="rk">${esc(r.request_key)}</span>
+        <span class="tag ${new Date(r.expires_at)<new Date()?"bad":"ok"}">
+          ${new Date(r.expires_at)<new Date()?"已过期":"有效"}</span>
+      </div>
+      <div class="hint">${esc(r.institution_code)} · ${r.sessions.length} 会话 · 签发 ${esc(r.issued_at)}</div>
+      <div class="hint">会话：${r.sessions.map(esc).join(", ")}</div>
+      <div class="row" style="margin-top:5px">
+        <button class="pillbtn" onclick="reuseKey('${esc(r.request_key)}')">用此键重放</button>
+        <button class="pillbtn" onclick="reExportDownload('${esc(r.request_key)}')">下载原包</button>
+        <button class="pillbtn" onclick="reVerifyStored('${esc(r.request_key)}')">核验</button>
+      </div>
+    </div>`).join("") || '<p class="muted small">暂无</p>';
+}
+function reuseKey(k){ document.getElementById("rcp-key").value=k; }
+async function reExportDownload(k){
+  const body={request_key:k,
+    institution_code:document.getElementById("rcp-inst").value.trim(),
+    sender_id:document.getElementById("rcp-sender").value.trim()};
+  const r=await api("/receipts",{method:"POST",body});
+  download(JSON.stringify(r.package,null,2), k+".receipt.json");
+  toast("已下载原包（同键重放）","ok");
+}
+async function reVerifyStored(k){
+  const body={request_key:k,
+    institution_code:document.getElementById("rcp-inst").value.trim(),
+    sender_id:document.getElementById("rcp-sender").value.trim()};
+  const r=await api("/receipts",{method:"POST",body});
+  showVerify({valid:true,note:"重放原包并离线核验",package:r.package});
+}
+function showVerify(result){
+  const out=document.getElementById("verify-out");
+  out.hidden=false;
+  if(result.valid){
+    const b=result.package.body;
+    out.textContent=JSON.stringify({valid:true,
+      institution_code:b.institution_code, sender_id:b.sender_id,
+      request_key:b.request_key, issued_at:b.issued_at, expires_at:b.expires_at,
+      sessions:b.sessions.map(s=>({session_id:s.session_id,
+        confirmed_watermark:s.confirmed_watermark, state:s.state,
+        rejections:s.rejections.length, head_event_hash:s.head_event_hash,
+        chain_digest:s.chain_digest}))},null,2);
+    toast("回执核验通过：签章/哈希链/水位/有效期全部合法","ok");
+  } else {
+    out.textContent=JSON.stringify(result,null,2);
+    toast("回执核验失败（详见输出）","bad");
+  }
+}
+async function verifyUploaded(){
+  const f=document.getElementById("upload-file").files[0];
+  if(!f){toast("请先选择文件","warn");return;}
+  const pkg=JSON.parse(await f.text());
+  await doVerify(pkg);
+}
+async function verifyPasted(){
+  try{ await doVerify(JSON.parse(document.getElementById("upload-paste").value)); }
+  catch(e){ toast("JSON 解析失败: "+e.message,"bad"); }
+}
+async function doVerify(pkg){
+  const r=await fetch(API+"/receipts/verify",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:JSON.stringify({package:pkg})});
+  const data=await r.json();
+  if(r.ok) showVerify({valid:true,package:pkg});
+  else showVerify({valid:false,...data});
+}
+
+// ---------------- 清理授权 ----------------
+async function fillLocalFromCurrent(){
+  if(!currentKey){toast("先在左侧选择会话","warn");return;}
+  const [sender,sid]=currentKey.split("|");
+  const d=await api(`/sessions/${encodeURIComponent(sender)}/${encodeURIComponent(sid)}`);
+  const local=d.confirmed_events.map(e=>({session_id:sid,revision:e.revision,event_hash:e.event_hash}));
+  document.getElementById("cleanup-local").value=JSON.stringify(local);
+  if(lastPackage)
+    document.getElementById("cleanup-pkg").value=JSON.stringify(lastPackage,null,2);
+  toast("已填入 "+local.length+" 个已确认事件；如尚未签发回执请先到「导出/下载」","info");
+}
+function tamperLocal(){
+  try{
+    const arr=JSON.parse(document.getElementById("cleanup-local").value);
+    if(arr.length<2){toast("至少需要 2 个事件","warn");return;}
+    arr[1].event_hash="ff".repeat(32);
+    document.getElementById("cleanup-local").value=JSON.stringify(arr,null,2);
+    toast("已把第 2 个事件哈希改为 ff…（模拟本地事件事后变化）","warn");
+  }catch(e){toast("先填入合法本地事件 JSON","bad");}
+}
+async function cleanupAuth(){
+  let pkg;
+  try{ pkg=JSON.parse(document.getElementById("cleanup-pkg").value); }
+  catch(e){ toast("回执包 JSON 非法","bad"); return; }
+  let local;
+  try{ local=JSON.parse(document.getElementById("cleanup-local").value||"[]"); }
+  catch(e){ toast("本地事件 JSON 非法","bad"); return; }
+  const r=await api("/cleanup-authorization",{method:"POST",body:{package:pkg,local_events:local}});
+  const out=document.getElementById("cleanup-out");
+  out.hidden=false; out.textContent=JSON.stringify(r,null,2);
+  if(r.authorized) toast("授权清理 "+r.allowed.length+" 个事件","ok");
+  else if(r.code==="RECEIPT_EXPIRED") toast("回执已过期，拒绝清理","bad");
+  else if(r.code==="RECEIPT_INVALID") toast("回执签章/包非法，拒绝清理","bad");
+  else toast("部分/全部拒绝："+r.denied.map(x=>x.reason).join(", "),"warn");
+}
+
+// ---------------- 租约 ----------------
+async function claimLease(worker){
+  const worker_id=worker||document.getElementById("lease-worker").value;
+  const body={session_id:document.getElementById("lease-session").value.trim(),worker_id};
+  const s=document.getElementById("lease-sender").value.trim();
+  if(s) body.sender_id=s;
+  const out=document.getElementById("lease-out"); out.hidden=false;
+  try{
+    const r=await api("/claim",{method:"POST",body});
+    out.textContent=JSON.stringify(r,null,2);
+    toast(worker_id+" 领取成功","ok");
+  }catch(e){
+    out.textContent=JSON.stringify(e.data,null,2);
+    toast(worker_id+" 领取被拒：租约被其他实例持有（不影响其他会话）","bad");
+  }
+  await loadSessions();
+  if(currentKey) renderDetail();
+}
+async function releaseLease(){
+  const body={session_id:document.getElementById("lease-session").value.trim(),
+    worker_id:document.getElementById("lease-worker").value};
+  const s=document.getElementById("lease-sender").value.trim();
+  if(s) body.sender_id=s;
+  const r=await api("/release-lease",{method:"POST",body});
+  document.getElementById("lease-out").hidden=false;
+  document.getElementById("lease-out").textContent=JSON.stringify(r,null,2);
+  toast("已释放租约","info");
+  await loadSessions();
+  if(currentKey) renderDetail();
+}
+
+loadAll().catch(e=>toast("初始化加载失败: "+e.message,"bad"));
+</script>
+</body>
+</html>

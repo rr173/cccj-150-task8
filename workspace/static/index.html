@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>地籍界址测量与宗地版本管理平台</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header>
+  <div class="brand">⛳ 地籍界址测量与宗地版本管理平台</div>
+  <nav>
+    <button data-tab="map" class="active">地图编辑</button>
+    <button data-tab="sync">离线同步</button>
+    <button data-tab="disputes">争议裁定 <span id="disp-badge" class="badge hidden">0</span></button>
+    <button data-tab="ops">分割/合并/更正</button>
+    <button data-tab="drafts">更正草案</button>
+    <button data-tab="plans">生效计划 <span id="plan-badge" class="badge hidden">0</span></button>
+    <button data-tab="snapshots">快照交换</button>
+    <button onclick="location.href='/relay'">📮 回执中继 ↗</button>
+    <button data-tab="certs">历史证明</button>
+    <button data-tab="lineage">版本血缘</button>
+  </nav>
+</header>
+
+<main>
+  <!-- ================= 地图 ================= -->
+  <section id="tab-map" class="tab active">
+    <div class="toolbar">
+      <fieldset>
+        <legend>工具</legend>
+        <button id="tool-pan" data-tool="pan">平移</button>
+        <button id="tool-add" data-tool="add" class="active">加点</button>
+        <button id="tool-drag" data-tool="drag">拖点</button>
+        <button id="tool-new" data-tool="new">新宗地</button>
+      </fieldset>
+      <fieldset>
+        <legend>编辑中候选环</legend>
+        <button id="btn-undo">撤销点</button>
+        <button id="btn-clear">清空</button>
+        <button id="btn-snap">自动闭合</button>
+        <span class="hint">面积：<b id="draft-area">—</b> m²</span>
+      </fieldset>
+      <fieldset>
+        <legend>时间点查询</legend>
+        <input type="datetime-local" id="as-of" step="1">
+        <button id="btn-query-at">查询时点</button>
+        <button id="btn-query-now">回到当前</button>
+      </fieldset>
+      <fieldset>
+        <legend>底图</legend>
+        <label><input type="checkbox" id="layer-current" checked> 当前宗地</label>
+        <label><input type="checkbox" id="layer-history"> 历史版本</label>
+        <label><input type="checkbox" id="layer-disp" checked> 争议几何</label>
+        <label><input type="checkbox" id="layer-plan" checked> 计划占用</label>
+        <label><input type="checkbox" id="layer-grid" checked> 坐标网格</label>
+      </fieldset>
+    </div>
+    <div class="map-wrap">
+      <canvas id="map" width="1180" height="680"></canvas>
+      <div id="map-status" class="map-status">坐标 — | 工具：加点 | 滚轮缩放 / 右键拖拽平移</div>
+    </div>
+  </section>
+
+  <!-- ================= 离线同步 ================= -->
+  <section id="tab-sync" class="tab">
+    <div class="cols">
+      <div class="panel">
+        <h3>1. 出工下载离线包</h3>
+        <label>作业宗地（可多选/空=新宗地）</label>
+        <select id="bundle-parcels" multiple size="4"></select>
+        <label>测绘员 <input id="bundle-surveyor" placeholder="姓名"></label>
+        <button id="btn-bundle">下载离线包 / 建作业单</button>
+        <pre id="bundle-out" class="code"></pre>
+      </div>
+      <div class="panel">
+        <h3>2. 采集界址点（离线）</h3>
+        <p class="hint">在地图上用「加点」采集；每点记录精度/界标/照片/相邻权利人确认。</p>
+        <table id="points-table">
+          <thead><tr><th>#</th><th>X</th><th>Y</th><th>精度(m)</th><th>界标</th>
+            <th>照片</th><th>邻人确认</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="row">
+          <label>声明面积 <input id="declared-area" type="number" placeholder="外业手簿"></label>
+          <label>目标宗地 <select id="target-parcel"><option value="">（新宗地）</option></select></label>
+          <label>相邻确认 <select id="confirm-neighbor"></select>
+            <input id="confirm-owner" placeholder="权利人姓名"></label>
+        </div>
+        <button id="btn-add-confirmation">＋添加相邻权利人确认</button>
+        <ul id="confirm-list" class="chips"></ul>
+      </div>
+      <div class="panel">
+        <h3>3. 回网提交候选边界</h3>
+        <label>作业单号 <input id="submit-job" placeholder="留空自动建单"></label>
+        <label>幂等键 <input id="idem-key" placeholder="设备生成 UUID"></label>
+        <div class="row">
+          <button id="btn-validate" class="secondary">仅预检</button>
+          <button id="btn-submit" class="primary">提交候选边界</button>
+        </div>
+        <pre id="submit-out" class="code"></pre>
+        <h3>作业单状态</h3>
+        <input id="job-query" placeholder="JOB-...">
+        <button id="btn-job-query" class="secondary">查询</button>
+        <pre id="job-out" class="code"></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 争议裁定 ================= -->
+  <section id="tab-disputes" class="tab">
+    <div class="cols">
+      <div class="panel">
+        <h3>未决争议</h3>
+        <div id="dispute-list"></div>
+      </div>
+      <div class="panel wide">
+        <h3>争议对比与裁定</h3>
+        <div id="dispute-detail"><p class="hint">从左侧选择一条争议。地图上：<span class="swatch base"></span>基线
+          <span class="swatch a"></span>A 方案（后提交方）
+          <span class="swatch b"></span>B 方案（先落库方）。
+          裁定只能选 A/B 或在两个固定锚点之间修订，不能重写其他边界。</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 分割/合并/更正 ================= -->
+  <section id="tab-ops" class="tab">
+    <div class="cols">
+      <div class="panel">
+        <h3>宗地分割</h3>
+        <p class="hint">在地图上采集第 1 个子宗环（自动闭合），系统校验子宗并集=父宗、面积守恒。</p>
+        <label>父版本 <select id="split-parent"></select></label>
+        <label>子宗 2 环 JSON <textarea id="split-child2" rows="3" placeholder="[[x,y],...]"></textarea></label>
+        <button id="btn-split" class="primary">用「编辑中候选环」+ 子宗2 执行分割</button>
+        <pre id="split-out" class="code"></pre>
+      </div>
+      <div class="panel">
+        <h3>宗地合并</h3>
+        <label>父版本（≥2，Ctrl 多选）<select id="merge-parents" multiple size="4"></select></label>
+        <p class="hint">合并结果环在地图上采集（应等于父宗并集）。</p>
+        <button id="btn-merge" class="primary">执行合并</button>
+        <pre id="merge-out" class="code"></pre>
+      </div>
+      <div class="panel">
+        <h3>历史更正（二阶段：草案 → 预演 → 发布）</h3>
+        <p class="hint">先建<b>草案</b>预演全部受影响后代（不改在版宗地），确认新几何/面积差/血缘后再<b>原子发布</b>。旧链与旧证明保留。</p>
+        <label>被更正目标版本 <select id="correct-version"></select></label>
+        <label>原因 <input id="correct-reason" placeholder="如：界址点解析错误"></label>
+        <p class="hint">更正后环在地图上采集（草案环以虚线显示，<b>不是</b>生效版本）。</p>
+        <button id="btn-correct-draft" class="primary">① 建草案并预演</button>
+        <pre id="correct-out" class="code"></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 更正草案（预演/漂移/发布/撤销）================= -->
+  <section id="tab-drafts" class="tab">
+    <div class="cols">
+      <div class="panel">
+        <h3>更正草案</h3>
+        <p class="hint">草案只保存预演，不改变任何在版宗地；发布时若基线已漂移会被拒绝并标出漂移节点，可重新预演。</p>
+        <select id="draft-list" size="8"></select>
+        <div class="row">
+          <button id="btn-draft-refresh" class="secondary">刷新</button>
+          <button id="btn-draft-rehearse" class="secondary">重新预演</button>
+          <button id="btn-draft-publish" class="primary">② 批准发布</button>
+          <button id="btn-draft-cancel" class="danger">撤销草案</button>
+        </div>
+        <div id="draft-status" class="hint"></div>
+        <h3>登记生效计划（未来执行）</h3>
+        <p class="hint">完成影响计算后可登记未来执行时间；系统对预演闭包内<b>全部目标地块</b>建立互斥占用，
+          相同请求键只生成一条计划。执行前若地块快照/争议/证书变化会自动<b>暂停</b>。</p>
+        <label>生效时间 <input type="datetime-local" id="plan-exec-at" step="1"></label>
+        <label>请求键 request_key <input id="plan-req-key" placeholder="相同请求只生成一条计划"></label>
+        <div class="row">
+          <button id="btn-register-plan" class="primary">③ 登记生效计划</button>
+          <button id="btn-goto-plans" class="secondary">打开计划时间轴</button>
+        </div>
+        <pre id="plan-register-out" class="code"></pre>
+      </div>
+      <div class="panel wide">
+        <h3>预演影响（受影响分割/合并后代）</h3>
+        <div id="draft-impact"></div>
+        <h3>漂移节点</h3>
+        <pre id="draft-drift" class="code"></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 生效计划（时间轴 + 侧栏）================= -->
+  <section id="tab-plans" class="tab">
+    <div class="plan-layout">
+      <!-- 侧栏：等待 / 暂停 / 完成 / 取消 -->
+      <aside class="panel plan-side">
+        <h3>生效计划</h3>
+        <p class="hint">执行器自动轮询到期计划；暂停后需先「恢复基线」，完成的计划不可二次落账。</p>
+        <div class="row" id="plan-filters">
+          <button data-f="ALL" class="active">全部</button>
+          <button data-f="WAITING" class="f-waiting">等待</button>
+          <button data-f="PAUSED" class="f-paused">暂停</button>
+          <button data-f="COMPLETED" class="f-done">完成</button>
+          <button data-f="CANCELLED" class="f-cancel">取消</button>
+        </div>
+        <button id="btn-plan-refresh" class="secondary">刷新清单</button>
+        <div id="plan-list"></div>
+      </aside>
+
+      <!-- 右栏：时间轴 + 详情/操作 + 占用对象 -->
+      <div class="plan-main">
+        <div class="panel">
+          <h3>执行时间轴</h3>
+          <div id="plan-timeline"></div>
+        </div>
+        <div class="panel">
+          <h3>计划详情与操作</h3>
+          <div id="plan-detail"><p class="hint">从左侧选择一条计划，或在「更正草案」页登记新的生效计划。</p></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 地籍快照交换包 ================= -->
+  <section id="tab-snapshots" class="tab">
+    <div class="snap-layout">
+      <!-- 导出 -->
+      <div class="panel">
+        <h3>① 按时间点导出离线包</h3>
+        <p class="hint">选取一组宗地与来源时间点，自动闭包版本链/共享边/争议/证明/生效计划；
+          生成带签章、可独立核验的内容清单与分块。</p>
+        <label>来源时间点 <input type="datetime-local" id="snap-at" step="1"></label>
+        <label>选择宗地（可多选）
+          <select id="snap-parcels" multiple size="5"></select></label>
+        <label>分块大小（字节）<input id="snap-chunk-size" type="number" value="16384" min="256"></label>
+        <div class="row">
+          <button id="btn-snap-export" class="primary">导出交换包</button>
+          <button id="btn-snap-download" class="secondary" disabled>下载 .pkg.json</button>
+        </div>
+        <pre id="snap-export-out" class="code"></pre>
+      </div>
+
+      <!-- 接收 -->
+      <div class="panel">
+        <h3>② 接收方：离线预检 → 分块上传</h3>
+        <p class="hint">无网络环境先预检；再建会话，分块支持乱序/重复/断点续传，
+          全部齐备且引用关系匹配后一次性导入。可指定<b>负责人</b>与<b>接收有效期</b>，
+          到期/人工冻结后保留已收分块但拒绝写入（须重开重验后续传）。</p>
+        <div class="row">
+          <label class="filebtn">选择清单/整包 JSON
+            <input type="file" id="snap-file" accept="application/json,.json"></label>
+          <button id="btn-snap-precheck" class="secondary">离线预检</button>
+          <button id="btn-snap-create" class="secondary">建导入会话</button>
+        </div>
+        <label>当前操作人（负责人标识，用于上传/终检/移交/续期/冻结/重开）
+          <input id="snap-actor" placeholder="如 alice" value="alice"></label>
+        <div class="row">
+          <label>负责人（留空=不限制）
+            <input id="snap-owner" placeholder="建会话时指定，默认同操作人" style="max-width:150px"></label>
+          <label>有效期（分钟，留空=不限期）
+            <input id="snap-ttl" type="number" min="1" placeholder="如 1440" style="max-width:120px"></label>
+        </div>
+        <label>或粘贴 package_id 继续已中断的上传
+          <input id="snap-resume-id" placeholder="PKG-..."></label>
+        <div class="row">
+          <button id="btn-snap-resume" class="secondary">载入会话</button>
+          <label>分块序号 <input id="snap-chunk-seq" type="number" min="0" value="0" style="max-width:90px"></label>
+          <label class="filebtn">选择分块文件
+            <input type="file" id="snap-chunk-file"></label>
+        </div>
+        <div class="row">
+          <button id="btn-snap-upload-one" class="secondary">上传该分块</button>
+          <button id="btn-snap-upload-all" class="secondary">乱序自动上传全部分块</button>
+          <button id="btn-snap-finalize" class="primary">终检并一次性导入</button>
+        </div>
+        <pre id="snap-import-out" class="code"></pre>
+      </div>
+
+      <!-- 会话与结果 -->
+      <div class="panel">
+        <h3>③ 会话状态 / 接收窗口 / 导入结果</h3>
+        <div class="row">
+          <button id="btn-snap-refresh" class="secondary">刷新会话清单</button>
+          <button id="btn-snap-cleanup" class="secondary">保留期清理</button>
+        </div>
+        <div id="snap-session-list"></div>
+        <div id="snap-detail"><p class="hint">导出或载入一个交换包后在此查看负责人、剩余时间、
+          冻结原因、缺块冲突、操作审计与新旧版本对应关系。</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 证明 ================= -->
+  <section id="tab-certs" class="tab">
+    <div class="cols">
+      <div class="panel">
+        <h3>签发证明</h3>
+        <label>版本 <select id="cert-version"></select></label>
+        <button id="btn-issue-cert" class="primary">签发</button>
+        <h3>验证证明</h3>
+        <input id="verify-cert-id" placeholder="CERT-2026-0001">
+        <button id="btn-verify-cert" class="secondary">验真</button>
+      </div>
+      <div class="panel wide">
+        <h3>证明文书 / 验真结果</h3>
+        <pre id="cert-out" class="code tall"></pre>
+      </div>
+      <div class="panel">
+        <h3>已签发清单</h3>
+        <div id="cert-list"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 血缘 ================= -->
+  <section id="tab-lineage" class="tab">
+    <div class="cols">
+      <div class="panel">
+        <h3>宗地</h3>
+        <select id="lineage-parcel"></select>
+        <h3>生命周期操作</h3>
+        <div id="ops-list"></div>
+      </div>
+      <div class="panel wide">
+        <h3>版本血缘与时间区间</h3>
+        <canvas id="lineage-canvas" width="900" height="520"></canvas>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
