@@ -83,7 +83,7 @@ pre{background:#0b121b;border:1px solid var(--line);border-radius:6px;padding:8p
 .receipt{border:1px solid var(--line);border-radius:8px;padding:9px 10px;margin-bottom:8px;background:var(--panel2)}
 .receipt .rk{font-family:ui-monospace,Menlo,monospace;font-weight:600}
 .pillbtn{font-size:11px;padding:3px 8px}
-.tabs{display:flex;gap:4px;margin-bottom:10px}
+.tabs{display:flex;gap:4px;margin-bottom:10px;flex-wrap:wrap}
 .tabs button{flex:0 auto}
 .tabs button.on{background:#1c4f7e;border-color:#2d73b0}
 details summary{cursor:pointer;color:var(--muted);font-size:12px;margin:4px 0}
@@ -156,6 +156,9 @@ code{background:#0b121b;padding:1px 5px;border-radius:4px;font-size:11px}
         <button id="tab-upload" onclick="switchTab('upload')">上传核验</button>
         <button id="tab-cleanup" onclick="switchTab('cleanup')">清理授权</button>
         <button id="tab-lease" onclick="switchTab('lease')">领取租约</button>
+        <button id="tab-rotation" onclick="switchTab('rotation')">密钥轮换</button>
+        <button id="tab-revocation" onclick="switchTab('revocation')">撤销清单</button>
+        <button id="tab-trust" onclick="switchTab('trust')">信任包</button>
       </div>
 
       <div id="pane-export">
@@ -224,6 +227,113 @@ code{background:#0b121b;padding:1px 5px;border-radius:4px;font-size:11px}
           <button class="warn" onclick="claimLease('worker-2')">模拟 worker-2 并发领取</button>
         </div>
         <pre id="lease-out" hidden></pre>
+      </div>
+
+      <!-- 机构签发密钥轮换 -->
+      <div id="pane-rotation" hidden>
+        <p class="hint">机构签发密钥按<b>纪元</b>轮换：旧钥签新钥形成连续签名链；
+          达到生效水位（机构单调回执序号）后只能用新钥签发，轮换前回执继续按旧钥验证。
+          两名管理员分别<b>登记</b>与<b>批准</b>，并发只有一个结果生效。</p>
+        <div class="field"><label>机构</label>
+          <input id="rot-inst" value="DEMO-IN"></div>
+        <button onclick="loadRotation()">刷新轮换链/预演</button>
+        <pre id="rot-preview" hidden></pre>
+        <div class="section-title">登记下一把公钥（管理员 A）</div>
+        <div class="grid2">
+          <div class="field"><label>登记请求键（幂等）</label>
+            <input id="rot-prop-key" value="ROT-PROP-1"></div>
+          <div class="field"><label>登记管理员</label>
+            <input id="rot-prop-by" value="admin-A"></div>
+        </div>
+        <div class="grid2">
+          <div class="field"><label>生效水位 activate_serial（留空=下一序号立即生效）</label>
+            <input id="rot-watermark" type="number" placeholder="如 5"></div>
+          <div class="field"><label>下一把公钥 hex（留空=服务端生成并托管）</label>
+            <input id="rot-pub" placeholder="留空自动生成新钥"></div>
+        </div>
+        <div class="row">
+          <button class="primary" onclick="rotationPropose(false)">① 登记（预演建议水位）</button>
+          <button onclick="rotationPropose(true)">同键重放</button>
+        </div>
+        <pre id="rot-prop-out" hidden></pre>
+        <div class="section-title">批准（管理员 B，双人控制）</div>
+        <div class="grid2">
+          <div class="field"><label>批准请求键（幂等）</label>
+            <input id="rot-appr-key" value="ROT-APPR-1"></div>
+          <div class="field"><label>批准管理员（须不同于登记人）</label>
+            <input id="rot-appr-by" value="admin-B"></div>
+        </div>
+        <div class="row">
+          <button class="primary" onclick="rotationApprove(false)">② 批准</button>
+          <button class="warn" onclick="rotationApprove(true)">模拟另一管理员并发批准</button>
+          <button onclick="rotationActivate()">手动生效检查</button>
+        </div>
+        <pre id="rot-appr-out" hidden></pre>
+        <div class="section-title">轮换签名链</div>
+        <div id="rot-chain"></div>
+      </div>
+
+      <!-- 版本化撤销清单 -->
+      <div id="pane-revocation" hidden>
+        <p class="hint">误签或密钥泄露后发布<b>版本化撤销清单</b>：版本号单调、
+          每版为全量并集（防回滚），按回执标识或签发时间区间选择，生效钥签名。</p>
+        <div class="field"><label>机构</label>
+          <input id="rev-inst" value="DEMO-IN"></div>
+        <div class="field"><label>发布请求键（幂等）</label>
+          <input id="rev-key" value="REV-1"></div>
+        <div class="field"><label>按回执请求键撤销（逗号分隔）</label>
+          <input id="rev-receipts" placeholder="REQ-DEMO-1"></div>
+        <div class="grid2">
+          <div class="field"><label>签发时间起（含，ISO）</label>
+            <input id="rev-from" placeholder="2026-10-01T00:00:00Z"></div>
+          <div class="field"><label>签发时间止（含，ISO）</label>
+            <input id="rev-to"></div>
+        </div>
+        <div class="field"><label>细粒度条目 JSON（会话/修订号，可选）</label>
+          <textarea id="rev-entries" rows="2" style="width:100%"
+            placeholder='[{"session_id":"PKG-HAPPY","revision":2}]'></textarea></div>
+        <div class="row">
+          <button class="primary" onclick="revocationPublish()">发布新版</button>
+          <button class="warn" onclick="revocationPublish(true)">同键重放</button>
+          <button onclick="loadRevocations()">刷新版本</button>
+        </div>
+        <pre id="rev-out" hidden></pre>
+        <div class="section-title">版本链（最新版在最后）</div>
+        <div id="rev-list"></div>
+      </div>
+
+      <!-- 离线信任包 -->
+      <div id="pane-trust" hidden>
+        <p class="hint">离线信任包内含<b>机构公钥链 + 全量撤销版本 + 单调包序号</b>，
+          由当前生效钥签名。导出后交给离线核验方导入；过期包、断链、撤销回滚、
+          已撤销回执都会被可定位拒绝。</p>
+        <div class="field"><label>机构</label>
+          <input id="trust-inst" value="DEMO-IN"></div>
+        <div class="grid2">
+          <div class="field"><label>导出请求键（幂等）</label>
+            <input id="trust-key" value="TRUST-1"></div>
+          <div class="field"><label>有效期 TTL（秒，默认 30 天）</label>
+            <input id="trust-ttl" type="number" placeholder="2592000"></div>
+        </div>
+        <div class="row">
+          <button class="primary" onclick="trustExport()">导出并下载信任包</button>
+          <button onclick="trustListImports()">查看已导入</button>
+        </div>
+        <div class="section-title">导入 / 核验信任包</div>
+        <input type="file" id="trust-file" accept=".json,application/json">
+        <div class="row" style="margin-top:6px">
+          <button onclick="trustImport()">导入信任包</button>
+          <button onclick="trustVerifyFile()">仅离线核验</button>
+        </div>
+        <pre id="trust-out" hidden></pre>
+        <div class="section-title">按当前信任根定位回执状态</div>
+        <p class="hint">在「导出/下载」签发的回执会自动带入；也可粘贴回执包后定位
+          （VALID / REVOKED / 信任包过期 / 水位后用旧钥 / 公钥不在链上）。</p>
+        <textarea id="trust-receipt" rows="4" style="width:100%"></textarea>
+        <div class="row" style="margin-top:6px">
+          <button class="primary" onclick="trustCheckReceipt()">定位回执状态</button>
+          <button onclick="trustUseLast()">带入最近签发回执</button>
+        </div>
       </div>
     </div>
   </div>
@@ -434,10 +544,12 @@ async function demoConflictRecover(){
 
 // ---------------- 回执 ----------------
 function switchTab(name){
-  ["export","upload","cleanup","lease"].forEach(t=>{
+  ["export","upload","cleanup","lease","rotation","revocation","trust"].forEach(t=>{
     document.getElementById("pane-"+t).hidden = t!==name;
     document.getElementById("tab-"+t).classList.toggle("on", t===name);
   });
+  if(name==="rotation") loadRotation();
+  if(name==="revocation") loadRevocations();
 }
 async function exportReceipt(replay){
   const key=document.getElementById("rcp-key").value.trim();
@@ -600,6 +712,194 @@ async function releaseLease(){
   toast("已释放租约","info");
   await loadSessions();
   if(currentKey) renderDetail();
+}
+
+// ---------------- 密钥轮换 ----------------
+function instPath(suffix){
+  return "/institutions/"+encodeURIComponent(document.getElementById("rot-inst").value.trim())+suffix;
+}
+async function loadRotation(){
+  const code=document.getElementById("rot-inst").value.trim();
+  try{
+    const [pv, list] = await Promise.all([
+      api(`/institutions/${encodeURIComponent(code)}/rotations/preview`),
+      api(`/institutions/${encodeURIComponent(code)}/rotations`)]);
+    const po=document.getElementById("rot-preview");
+    po.hidden=false;
+    po.textContent=JSON.stringify({active_epoch:pv.active_epoch,
+      next_serial:pv.next_serial,pending_epoch:pv.pending_epoch,
+      pending_status:pv.pending_status,suggested_activate_serial:pv.suggested_activate_serial,
+      effect:pv.effect,receipts_still_signed_by_old_key:pv.receipts_still_signed_by_old_key},
+      null,2);
+    if(!document.getElementById("rot-watermark").value)
+      document.getElementById("rot-watermark").value=pv.suggested_activate_serial;
+    document.getElementById("rot-chain").innerHTML = list.rotations.map(r=>`
+      <div class="receipt">
+        <div class="row" style="justify-content:space-between">
+          <span class="rk">纪元 ${r.epoch} ${r.epoch===list.active_epoch?'<span class="tag teal">生效中</span>':""}</span>
+          <span class="tag ${r.status==="ACTIVE"?"teal":(r.status==="APPROVED"?"warn":"bad")}">${r.status}</span>
+        </div>
+        <div class="hint">生效水位 serial ≥ <b>${r.activate_serial}</b> · 公钥 ${shortH(r.public_key)}</div>
+        <div class="hint">登记 ${esc(r.proposed_by)} @ ${esc(r.proposed_at||"")}
+          ${r.approved_by?(" · 批准 "+esc(r.approved_by)):""}</div>
+      </div>`).join("");
+  }catch(e){ toast("加载轮换信息失败: "+e.message,"bad"); }
+}
+async function rotationPropose(replay){
+  const code=document.getElementById("rot-inst").value.trim();
+  const wm=document.getElementById("rot-watermark").value.trim();
+  const body={request_key:document.getElementById("rot-prop-key").value.trim(),
+    proposed_by:document.getElementById("rot-prop-by").value.trim(),
+    activate_serial:Number(wm)};
+  const pub=document.getElementById("rot-pub").value.trim();
+  if(pub) body.next_public_key=pub;
+  const out=document.getElementById("rot-prop-out"); out.hidden=false;
+  try{
+    const r=await api(`/institutions/${encodeURIComponent(code)}/rotations/propose`,
+      {method:"POST",body});
+    out.textContent=JSON.stringify(r,null,2);
+    toast((r.replayed?"重放命中首次登记":"已登记（PROPOSED）")+
+      ` · 纪元 ${r.rotation.epoch} · 水位 ${r.rotation.activate_serial}`,"ok");
+    await loadRotation();
+  }catch(e){ out.textContent=JSON.stringify(e.data,null,2); toast("登记失败: "+e.message,"bad"); }
+}
+async function rotationApprove(race){
+  const code=document.getElementById("rot-inst").value.trim();
+  const body={request_key:document.getElementById(race?"rot-appr-key":"rot-appr-key").value.trim()
+      +(race?"-RACE":""),
+    approved_by:race?"admin-C":document.getElementById("rot-appr-by").value.trim()};
+  const out=document.getElementById("rot-appr-out"); out.hidden=false;
+  try{
+    const r=await api(`/institutions/${encodeURIComponent(code)}/rotations/approve`,
+      {method:"POST",body});
+    out.textContent=JSON.stringify(r,null,2);
+    toast((r.replayed?"同键重放批准":"已批准")+
+      ` · 纪元 ${r.rotation.epoch} · 状态 ${r.rotation.status}`,"ok");
+    await loadRotation();
+  }catch(e){
+    out.textContent=JSON.stringify(e.data,null,2);
+    if(e.data&&e.data.error==="APPROVAL_RACE")
+      toast(`并发批准落败：${e.data.approved_by} 的批准先生效（只一个结果）`,"warn");
+    else toast("批准失败: "+e.message,"bad");
+  }
+}
+async function rotationActivate(){
+  const code=document.getElementById("rot-inst").value.trim();
+  const out=document.getElementById("rot-appr-out"); out.hidden=false;
+  try{
+    const r=await api(`/institutions/${encodeURIComponent(code)}/rotations/activate`,
+      {method:"POST",body:{}});
+    out.textContent=JSON.stringify(r,null,2);
+    toast(`生效检查完成 · 生效纪元 ${r.rotation.epoch}（${r.rotation.status}）`,"info");
+    await loadRotation();
+  }catch(e){ out.textContent=JSON.stringify(e.data,null,2); toast("生效失败: "+e.message,"bad"); }
+}
+
+// ---------------- 撤销清单 ----------------
+async function revocationPublish(replay){
+  const code=document.getElementById("rev-inst").value.trim();
+  const body={request_key:document.getElementById("rev-key").value.trim()+(replay?"-REPLAY":"")};
+  const receipts=document.getElementById("rev-receipts").value.trim();
+  if(receipts) body.receipts=receipts.split(",").map(x=>x.trim());
+  const from=document.getElementById("rev-from").value.trim();
+  const to=document.getElementById("rev-to").value.trim();
+  if(from||to) body.time_range={issued_from:from||null,issued_to:to||null};
+  const entries=document.getElementById("rev-entries").value.trim();
+  if(entries){ try{ body.entries=JSON.parse(entries); }
+    catch(e){ toast("条目 JSON 非法","bad"); return; } }
+  body.note= replay?"页面同键重放":"页面发布";
+  const out=document.getElementById("rev-out"); out.hidden=false;
+  try{
+    const r=await api(`/institutions/${encodeURIComponent(code)}/revocations`,
+      {method:"POST",body});
+    out.textContent=JSON.stringify(r.revocation,null,2);
+    toast((r.replayed?"同键重放，返回首版":`已发布 v${r.revocation.version}`)+
+      ` · 累计 ${r.revocation.entry_count} 条`,"ok");
+    await loadRevocations();
+  }catch(e){ out.textContent=JSON.stringify(e.data,null,2); toast("发布失败: "+e.message,"bad"); }
+}
+async function loadRevocations(){
+  const code=document.getElementById("rev-inst").value.trim();
+  try{
+    const d=await api(`/institutions/${encodeURIComponent(code)}/revocations`);
+    document.getElementById("rev-list").innerHTML=d.versions.map(v=>`
+      <div class="receipt">
+        <div class="row" style="justify-content:space-between">
+          <span class="rk">v${v.version}</span>
+          <span class="tag ${v.version===d.latest_version?"teal":""}">${v.entry_count} 条</span>
+        </div>
+        <div class="hint">签名纪元 ${v.signer_epoch} · ${esc(v.published_at)}</div>
+        <div class="hint">摘要 ${shortH(v.digest)} ← ${shortH(v.prev_digest)}</div>
+        <details><summary>撤销条目</summary><pre>${esc(JSON.stringify(v.entries,null,2))}</pre></details>
+      </div>`).join("");
+  }catch(e){ toast("加载撤销版本失败: "+e.message,"bad"); }
+}
+
+// ---------------- 离线信任包 ----------------
+async function trustExport(){
+  const code=document.getElementById("trust-inst").value.trim();
+  const body={institution_code:code,
+    request_key:document.getElementById("trust-key").value.trim()};
+  const ttl=document.getElementById("trust-ttl").value.trim();
+  if(ttl) body.ttl_seconds=Number(ttl);
+  try{
+    const r=await api("/trust-bundles",{method:"POST",body});
+    download(JSON.stringify(r.package,null,2), body.request_key+".trust.json");
+    document.getElementById("trust-receipt").dataset.lastBundle=JSON.stringify(r.package);
+    toast((r.replayed?"重放原信任包":"已导出信任包")+
+      ` · 序号 ${r.package.body.bundle_serial} · 生效纪元 ${r.package.signer_epoch}`,"ok");
+  }catch(e){ toast("导出失败: "+e.message,"bad"); }
+}
+async function _trustFile(){
+  const f=document.getElementById("trust-file").files[0];
+  if(!f){ toast("请先选择信任包文件","warn"); return null; }
+  return JSON.parse(await f.text());
+}
+async function trustImport(){
+  const pkg=await _trustFile(); if(!pkg) return;
+  const out=document.getElementById("trust-out"); out.hidden=false;
+  try{
+    const r=await api("/trust-bundles/import",{method:"POST",body:{package:pkg}});
+    out.textContent=JSON.stringify(r,null,2);
+    toast((r.replayed?"重导幂等":"已导入")+` · 序号 ${r.bundle_serial}`,"ok");
+  }catch(e){ out.textContent=JSON.stringify(e.data??e,null,2);
+    const codes=(e.data&&e.data.problems||[]).map(p=>p.code);
+    toast("导入被拒: "+(codes.join(", ")||e.message),"bad"); }
+}
+async function trustVerifyFile(){
+  const pkg=await _trustFile(); if(!pkg) return;
+  const r=await fetch(API+"/trust-bundles/verify",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:JSON.stringify({package:pkg})});
+  const data=await r.json();
+  const out=document.getElementById("trust-out"); out.hidden=false;
+  out.textContent=JSON.stringify(data,null,2);
+  if(r.ok) toast("信任包核验通过：公钥链/撤销链/签名/有效期合法","ok");
+  else toast("信任包核验失败: "+(data.problems||[]).map(p=>p.code).join(", "),"bad");
+}
+async function trustListImports(){
+  const d=await api("/trust-bundles/imports?institution_code="+
+    encodeURIComponent(document.getElementById("trust-inst").value.trim()));
+  const out=document.getElementById("trust-out"); out.hidden=false;
+  out.textContent=JSON.stringify(d,null,2);
+}
+function trustUseLast(){
+  if(lastPackage) document.getElementById("trust-receipt").value=
+    JSON.stringify(lastPackage,null,2);
+  else toast("请先在「导出/下载」签发回执","warn");
+}
+async function trustCheckReceipt(){
+  let pkg;
+  try{ pkg=JSON.parse(document.getElementById("trust-receipt").value); }
+  catch(e){ toast("回执包 JSON 非法","bad"); return; }
+  const r=await fetch(API+"/receipts/status",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({package:pkg})});
+  const data=await r.json();
+  const out=document.getElementById("trust-out"); out.hidden=false;
+  out.textContent=JSON.stringify(data,null,2);
+  const tone={VALID:"ok",REVOKED:"bad",TRUST_EXPIRED:"bad",EXPIRED:"warn",
+    DENIED:"bad",TRUST_DENIED:"bad",TRUST_INVALID:"bad",INVALID:"bad"}[data.status]||"warn";
+  toast("回执状态: "+data.status+(data.code?(" · "+data.code):""),tone);
 }
 
 loadAll().catch(e=>toast("初始化加载失败: "+e.message,"bad"));

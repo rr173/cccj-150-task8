@@ -23,6 +23,7 @@ import json
 from dataclasses import dataclass
 
 from . import config, crypto
+from . import trust as trust_svc
 from .store import tx, init_relay_db, audit, get_or_create_session
 from ..services.ids import new_id, now_iso
 
@@ -767,7 +768,6 @@ def export_receipt(*, request_key: str, institution_code: str,
                    session_ids: list[str] | None = None) -> dict:
     """导出（或重放）签名回执包。同 request_key 永远返回同一原包。"""
     init_relay_db()
-    seed = crypto.load_institution_seed(institution_code)
     ttl = ttl_seconds if ttl_seconds is not None else config.RECEIPT_TTL_SECONDS
     from datetime import datetime, timedelta, timezone
     with tx() as conn:
@@ -797,6 +797,11 @@ def export_receipt(*, request_key: str, institution_code: str,
                     f"{now_dt.microsecond // 1000:03d}Z"
         expires_at = (now_dt + timedelta(seconds=ttl)).strftime(
             "%Y-%m-%dT%H:%M:%S.") + f"{(now_dt + timedelta(seconds=ttl)).microsecond // 1000:03d}Z"
+        # 机构签发密钥轮换：引导信任根 -> 幂等生效到水位 -> 分配机构单调序号，
+        # 用当前生效纪元的密钥签名；达到水位后不可能再用旧钥签发。
+        sign_ctx = trust_svc.signing_context_in_tx(conn, institution_code)
+        serial, signer_epoch, seed = (sign_ctx["serial"], sign_ctx["epoch"],
+                                      sign_ctx["seed"])
         body = {
             "format": crypto.RECEIPT_FORMAT,
             "request_key": request_key,
@@ -806,26 +811,34 @@ def export_receipt(*, request_key: str, institution_code: str,
             "issued_at": issued_at,
             "expires_at": expires_at,
             "sessions": snapshots,
+            "serial_no": serial,
+            "signer_epoch": signer_epoch,
         }
         signature = crypto.sign_receipt(body, seed)
-        pubkey = crypto.load_institution_public(institution_code)
+        pubkey = crypto.epoch_pub_path(institution_code, signer_epoch)
+        if pubkey.exists():
+            institution_pubkey = pubkey.read_text(encoding="ascii").strip()
+        else:
+            institution_pubkey = crypto.load_institution_public(institution_code)
         package = {
             "body": body,
-            "institution_public_key": pubkey,
+            "institution_public_key": institution_pubkey,
             "signature": signature,
         }
         pkg_json = json.dumps(package, ensure_ascii=False, default=str)
         conn.execute(
             "INSERT INTO relay_receipt(request_key,institution_code,sender_id,"
-            "sessions_json,package_json,signature,issued_at,expires_at,created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?)",
+            "sessions_json,package_json,signature,issued_at,expires_at,"
+            "created_at,serial_no,signer_epoch)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (request_key, institution_code, sender_id,
              json.dumps(sids, ensure_ascii=False), pkg_json, signature,
-             issued_at, expires_at, now_iso()))
+             issued_at, expires_at, now_iso(), serial, signer_epoch))
         audit(conn, "RECEIPT_EXPORT", sender_id=sender_id,
               detail={"request_key": request_key,
                       "institution": institution_code,
-                      "sessions": sids})
+                      "sessions": sids, "serial_no": serial,
+                      "signer_epoch": signer_epoch})
         return {"replayed": False, "package": package}
 
 

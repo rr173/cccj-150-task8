@@ -15,13 +15,16 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 运行测试：
 
 ```bash
-python3 -m pytest tests/ -q          # 192 项：业务规则 + HTTP 集成 + 回执中继（水位/隔离/回执/租约/并发/CLI/RFC8032）
+python3 -m pytest tests/ -q          # 233 项：业务规则 + HTTP 集成 + 回执中继（水位/隔离/回执/租约/并发/CLI/RFC8032/密钥轮换/撤销/离线信任包）
 python3 demo_live.py                 # 完整 HTTP 端到端演示（需先启动服务并 seed）
 
 # 交换包交付回执中继：命令行模拟器 / 独立核验器（可不启动 HTTP 直连库演示）
 RELAY_DATA_DIR=data/relay python3 -m app.relay.cli --sender site-A demo
 RELAY_DATA_DIR=data/relay python3 -m app.relay.cli --sender site-A recovery
+RELAY_DATA_DIR=data/relay python3 -m app.relay.cli --institution DEMO-IN rotate-demo
 python3 -m app.relay.verifier REQ-1.receipt.json          # 完全离线核验回执包
+python3 -m app.relay.verifier TRUST-1.trust.json          # 离线核验机构信任包
+python3 -m app.relay.verifier --trust TRUST-1.trust.json REQ-1.receipt.json  # 以信任根定位回执
 # 网页界面：启动服务后打开 http://localhost:8000/relay
 ```
 
@@ -288,7 +291,122 @@ POST /api/relay/demo/*                       网页演示端点（演示私钥�
 核验**、清理授权（一键把本地事件哈希篡改为 `ff…` 演示拒绝）、两实例并发
 领取租约；顶部按钮一键演示乱序缺口→补传→批量重放完成→制造同序号异内容
 隔离（旁边 `PKG-HEALTHY` 保持健康）→撤回误版恢复。命令行模拟器
-`python -m app.relay.cli demo|recovery|push|receipt` 走完全相同的服务管线。
+`python -m app.relay.cli demo|recovery|push|receipt|rotation|revocation|trust|rotate-demo`
+走完全相同的服务管线。
+
+## 机构签发密钥轮换 / 回执撤销 / 离线信任包
+
+在连续水位回执中继之上，机构侧增加**离线可验证**的签发密钥轮换与
+回执撤销机制。全部状态在中继独立 SQLite 库中，写操作走
+`BEGIN IMMEDIATE` 串行事务 + 部分唯一索引，两名管理员并发登记或批准时
+**只有一个结果生效**；服务重启后状态不回退、不重复切换。
+
+### 签发密钥轮换（连续签名链 / 生效水位 / 双人控制）
+
+* 机构签发钥按**纪元（epoch）**组织：epoch 0 为创世钥（既有
+  `{code}.pub` 引导，首次使用时幂等归档为 `{code}.e0.seed`）。
+* 管理员 A 用**幂等登记请求键** `POST .../rotations/propose`
+  登记「下一把公钥 + 生效水位 `activate_serial`」：
+  * 新钥必须对登记挑战签名（PoP，证明持有对应私钥）；也可由服务端
+    直接生成并把种子固化为 0600 的 `{code}.eN.seed`（首次登记响应
+    回传一次）；
+  * 水位不得落在当前机构单调回执序号之后（`ACTIVATE_SERIAL_IN_PAST`，
+    轮换不可追溯，防止回退重签）；
+  * 同一机构至多一条未生效轮换，并发登记靠部分唯一索引只允许一条胜出
+    （`PENDING_ROTATION_EXISTS`）；同请求键重放返回首次结果。
+* 管理员 B（**必须不同于登记人**，`APPROVER_MUST_DIFFER`）用独立的
+  批准请求键 `POST .../rotations/approve`：**旧钥对整条轮换记录签名**
+  （批准签章背书新钥）；两名管理员用不同批准键并发批准时只有一个生效，
+  另一个得到 409 `APPROVAL_RACE` 并标明胜出者；同键重放返回首次批准。
+* 状态机 `PROPOSED → APPROVED → ACTIVE`。达到生效水位（机构内单调
+  **回执序号** `serial_no` ≥ `activate_serial`）后：下一张回执签发时
+  在同一事务内**幂等自动生效**新钥（重启/重入不重复切换），
+  `POST .../rotations/activate` 可手动触发；水位之前的回执永远继续
+  按旧钥验证，水位之后不可能再用旧钥签发。
+* 每条轮换记录有不可变 `record_hash`（固定字段规范化 SHA256）与
+  `prev_record_hash`，与创世记录一起构成**连续签名链**；新钥 PoP、
+  旧钥批准签章、纪元连续性、水位单调性全部可离线重算。
+* `GET .../rotations/preview` 为只读**预演**：给当前纪元/下一序号/
+  建议水位/「还有几张回执会由旧钥签发」/ 生效预测（IMMEDIATE/
+  DEFERRED），不落任何状态。
+
+### 版本化撤销清单（按回执标识 / 时间区间）
+
+* `POST .../revocations` 发布新版：可按**回执请求键**（整包撤销）、
+  **签发时间区间** `time_range.issued_from/issued_to`（查已签发回执）、
+  或显式细粒度条目（`sender_id/session_id/revision`）选择，取并集。
+* 版本号机构内单调（v1 为引导时的空集锚点），每版都是**完整撤销条目
+  集合**且必须是上一版超集；逐版带 `prev_digest` 摘要链、发布时间与
+  当时**生效纪元密钥**的签名。发布请求键幂等（同键永远返回首版）。
+
+### 离线信任包（导出 / 导入 / 可定位拒绝）
+
+`POST /api/relay/trust-bundles` 导出 `relay-trust-bundle/v1`：
+
+```
+body: format/bundle_serial(单调)/institution/root_epoch/
+      key_chain(全部 ACTIVE/APPROVED 纪元记录, 含 PoP/旧钥批准签章/prev 哈希)/
+      revocation_versions(全量撤销版本链)/issued_at/expires_at
+signer_epoch + signature   # 当前生效钥对规范化正文签名
+```
+
+* 导出请求键幂等（同键返回原包）；包序号机构内单调。
+* 核验器（`verifier.verify_trust_bundle`，纯离线）逐纪元重算
+  record_hash / prev 链接 / PoP / **旧钥批准签名** / 水位单调，
+  逐版重算撤销摘要 / 签名 / **超集单调（REVOCATION_ROLLBACK）**，
+  并校验包签名与有效期；每个问题都带 `where/epoch/version` 等定位字段。
+* `POST /api/relay/trust-bundles/import` 核验后落库：同机构同包序号
+  + 同内容幂等重导，同序号异内容 409 `TRUST_SERIAL_CONFLICT`；
+  核验不过的包不导入（返回全部可定位 problems）。
+* `check_receipt_against_trust(receipt, bundle)`（CLI:
+  `verifier --trust 信任包 回执包`，以及 `POST /receipts/status`）
+  以信任包为根定位回执：
+
+| 结论 | 触发 |
+| --- | --- |
+| `VALID` | 回执自签章合法；内嵌公钥在轮换链上；序号落在该纪元水位区间；未撤销；包未过期 |
+| `REVOKED` | 命中当前撤销集合（包级键或会话/修订级，返回具体条目） |
+| `TRUST_EXPIRED` | 信任包已过期（独立可验但不能放行） |
+| `EXPIRED` | 回执自身过期 |
+| `DENIED` | `SIGNING_KEY_NOT_IN_CHAIN` / `RECEIPT_EPOCH_KEY_MISMATCH` / `SIGNED_AFTER_WATERMARK_WITH_OLD_KEY`（水位后旧钥/伪造钥）|
+| `TRUST_DENIED` | 信任包断链（`ROTATION_CHAIN_BROKEN`）/ 批准签名非法 / 撤销回滚等 |
+
+**未撤销的历史回执**（无论用哪把旧钥）在轮换、多次撤销之后仍验证通过。
+
+### 崩溃 / 重启 / 并发一致性
+
+* 轮换状态、批准签章、回执序号、撤销版本全部在同一串行写库；
+  回执序号分配与「到水位自动切换」在签发事务内一次完成
+  （`relay_institution.next_serial` 只增），崩溃在切换前后都安全：
+  已 ACTIVE 的重启后仍是 ACTIVE 且 `activated_at` 不被重写，
+  APPROVED 未到水位的保持 APPROVED，到水位由下一张回执幂等切换。
+* 并发登记 / 并发批准由部分唯一索引（单条 pending、登记键、批准键）
+  + 条件 UPDATE（`... WHERE status='PROPOSED'`）保证只一个结果生效。
+
+```
+GET  /api/relay/institutions/{code}/rotations/preview   轮换预演（只读）
+POST /api/relay/institutions/{code}/rotations/propose   登记下一把公钥+生效水位（幂等）
+POST /api/relay/institutions/{code}/rotations/approve   第二管理员批准（双人控制/并发裁决）
+POST /api/relay/institutions/{code}/rotations/activate  手动生效检查
+GET  /api/relay/institutions/{code}/rotations           轮换签名链视图
+POST /api/relay/institutions/{code}/revocations         发布撤销版本（标识/区间/条目；幂等）
+GET  /api/relay/institutions/{code}/revocations         撤销版本链
+POST /api/relay/trust-bundles                           导出离线信任包（公钥链+撤销+单调序号）
+POST /api/relay/trust-bundles/import                    导入（核验；同序号幂等/异内容 409）
+POST /api/relay/trust-bundles/verify                    信任包离线核验
+GET  /api/relay/trust-bundles/imports                   已导入信任包
+POST /api/relay/receipts/status                         以当前信任根定位回执状态
+```
+
+CLI：`rotation preview|propose|approve|activate|list`、
+`revocation publish|list`、`trust export|verify|import|check`、
+`rotate-demo`（轮换预演→登记→并发批准裁决→水位切换→旧回执持续可验→
+撤销→信任包导出/导入→离线定位已撤销/断链/撤销回滚/过期包，13 步全断言）。
+网页 `/relay` 右侧新增「密钥轮换 / 撤销清单 / 信任包」三个页签。
+
+| 环境变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `RELAY_TRUST_BUNDLE_TTL_SECONDS` | 2592000（30 天） | 离线信任包默认有效期（过期必须重新导入）|
 
 ### 回执中继坐标与目录（`app/relay/config.py`）
 
@@ -394,6 +512,13 @@ POST /api/relay/claim | release-lease          工作实例单会话处理租约
 POST /api/relay/receipts                       按机构签发/同键重放离线回执包
 POST /api/relay/receipts/verify                上传回执包离线核验
 POST /api/relay/cleanup-authorization          清理授权（过期/本地变化拒绝）
+POST /api/relay/trust-bundles                  导出离线信任包（机构公钥链/撤销版本/单调序号）
+POST /api/relay/trust-bundles/import|verify    导入（同序号幂等/异内容409）/离线核验
+GET  /api/relay/trust-bundles/imports          已导入信任包
+GET  /api/relay/institutions/{c}/rotations[/preview]  轮换链视图 / 预演
+POST /api/relay/institutions/{c}/rotations/propose|approve|activate  登记/批准/生效
+GET|POST /api/relay/institutions/{c}/revocations      版本化撤销清单
+POST /api/relay/receipts/status                以当前信任根定位回执（VALID/REVOKED/过期/断链）
 POST /api/certificates           签发证明
 GET  /api/certificates/{id}/verify
 GET  /api/parcels/{id}?at=ISO    单宗时点状态（含血缘操作）
@@ -422,15 +547,17 @@ app/
   routers/           HTTP 层（含 effect-plans 生效计划、snapshots 快照交换包、relay 回执中继）
   relay/             **交付回执中继**（独立库）：
                        ed25519.py 纯 Python RFC8032（基点预计算 + 多标量乘，~2ms 验签）
-                       crypto.py 事件哈希链/发送方签章/机构回执签章
-                       store.py  原始事件只追加/连续水位/隔离/租约/请求键持久化
-                       service.py 推送/水位推进/隔离恢复/回执导出/清理授权/领取租约
-                       verifier.py 完全离线核验器（`python -m app.relay.verifier`）
-                       cli.py 命令行发送端模拟器（demo/recovery/push/receipt）
+                       crypto.py 事件哈希链/发送方签章/机构回执签章/轮换批准/撤销/信任包签章
+                       store.py  原始事件只追加/连续水位/隔离/租约/机构纪元/轮换链/撤销版本/信任包
+                       service.py 推送/水位推进/隔离恢复/回执导出（单调序号+纪元钥）/清理授权/领取租约
+                       trust.py  密钥轮换（登记/批准/生效）/版本化撤销/信任包导出导入/回执定位
+                       verifier.py 完全离线核验器（回执包 + 信任包/轮换链/撤销回滚；`python -m app.relay.verifier`）
+                       cli.py 命令行（demo/recovery/push/receipt/rotation/revocation/trust/rotate-demo）
                        demo.py 网页演示用本地签名发送方
 static/              Canvas 编辑器 + `relay/index.html` 回执中继网页界面（零依赖）
 tests/               业务规则 + HTTP 集成测试
-                     （test_relay_*.py 覆盖中继核心/回执清理/租约/并发/RFC8032 向量/CLI 共 62 项）
+                     （test_relay_*.py 覆盖中继核心/回执清理/租约/并发/RFC8032 向量/CLI/
+                       密钥轮换/撤销/离线信任包，共 103 项中继测试）
 seed.py              演示种子（甲/乙两宗，共享 x=100 边）
 demo_live.py         实时端到端断言脚本
 ```

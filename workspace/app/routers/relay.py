@@ -6,9 +6,12 @@ from fastapi.responses import JSONResponse
 
 from ..services.ids import now_iso
 from ..relay import service, crypto
+from ..relay import trust as trust_svc
 from ..relay import demo as demo_svc
 from ..relay.store import init_relay_db
-from ..relay.verifier import verify_receipt_package, ReceiptError
+from ..relay.verifier import (verify_receipt_package, ReceiptError,
+                              verify_trust_bundle, TrustBundleError,
+                              check_receipt_against_trust)
 
 router = APIRouter(prefix="/api/relay", tags=["relay"])
 
@@ -168,6 +171,156 @@ def cleanup_authorization(body: dict):
     return service.authorize_cleanup(
         package=package, local_events=body.get("local_events", []),
         at=body.get("at"))
+
+
+# ---- 机构签发密钥轮换（预演/登记/批准/生效/查询） ------------------------
+
+def _trust_err(exc: trust_svc.TrustError) -> JSONResponse:
+    payload = {"error": exc.code, "message": str(exc)}
+    payload.update(exc.extra)
+    return JSONResponse(payload, status_code=exc.status)
+
+
+@router.get("/institutions/{code}/rotations/preview")
+def rotation_preview(code: str, activate_serial: int | None = None,
+                     next_public_key: str | None = None):
+    try:
+        return trust_svc.rotation_preview(
+            code, activate_serial=activate_serial,
+            next_public_key=next_public_key)
+    except trust_svc.TrustError as e:
+        return _trust_err(e)
+    except FileNotFoundError:
+        return JSONResponse({"error": "INSTITUTION_KEY_MISSING",
+                             "message": "机构密钥未初始化"}, 409)
+
+
+@router.post("/institutions/{code}/rotations/propose")
+def propose_rotation(code: str, body: dict):
+    try:
+        return trust_svc.propose_rotation(
+            code,
+            request_key=body.get("request_key"),
+            proposed_by=body.get("proposed_by"),
+            activate_serial=body.get("activate_serial"),
+            next_public_key=body.get("next_public_key"),
+            next_seed_hex=body.get("next_seed_hex"),
+            pop_signature=body.get("pop_signature"))
+    except trust_svc.TrustError as e:
+        return _trust_err(e)
+    except FileNotFoundError:
+        return JSONResponse({"error": "INSTITUTION_KEY_MISSING",
+                             "message": "机构密钥未初始化"}, 409)
+
+
+@router.post("/institutions/{code}/rotations/approve")
+def approve_rotation(code: str, body: dict):
+    try:
+        return trust_svc.approve_rotation(
+            code, request_key=body.get("request_key"),
+            approved_by=body.get("approved_by"),
+            epoch=body.get("epoch"), rotation_id=body.get("rotation_id"))
+    except trust_svc.TrustError as e:
+        return _trust_err(e)
+
+
+@router.post("/institutions/{code}/rotations/activate")
+def activate_rotation(code: str, body: dict | None = None):
+    body = body or {}
+    try:
+        return trust_svc.activate_rotation(
+            code, epoch=body.get("epoch"),
+            rotation_id=body.get("rotation_id"))
+    except trust_svc.TrustError as e:
+        return _trust_err(e)
+
+
+@router.get("/institutions/{code}/rotations")
+def list_rotations(code: str):
+    try:
+        return trust_svc.list_rotations(code)
+    except FileNotFoundError:
+        return JSONResponse({"error": "INSTITUTION_KEY_MISSING",
+                             "message": "机构密钥未初始化"}, 409)
+
+
+# ---- 回执撤销（按标识/时间区间，版本化） ---------------------------------
+
+@router.post("/institutions/{code}/revocations")
+def publish_revocation(code: str, body: dict):
+    try:
+        return trust_svc.publish_revocation(
+            code, request_key=body.get("request_key"),
+            receipts=body.get("receipts"), entries=body.get("entries"),
+            time_range=body.get("time_range"), note=body.get("note"))
+    except trust_svc.TrustError as e:
+        return _trust_err(e)
+
+
+@router.get("/institutions/{code}/revocations")
+def list_revocations(code: str):
+    try:
+        return trust_svc.list_revocations(code)
+    except FileNotFoundError:
+        return JSONResponse({"error": "INSTITUTION_KEY_MISSING",
+                             "message": "机构密钥未初始化"}, 409)
+
+
+# ---- 离线信任包导出 / 导入 / 核验 / 回执状态 -----------------------------
+
+@router.post("/trust-bundles")
+def export_trust_bundle(body: dict):
+    try:
+        return trust_svc.export_trust_bundle(
+            body["institution_code"], request_key=body["request_key"],
+            ttl_seconds=body.get("ttl_seconds"),
+            institution_title=body.get("institution_title"))
+    except trust_svc.TrustError as e:
+        return _trust_err(e)
+    except FileNotFoundError:
+        return JSONResponse({"error": "INSTITUTION_KEY_MISSING",
+                             "message": "机构密钥未初始化"}, 409)
+    except KeyError as e:
+        return JSONResponse({"error": "BAD_REQUEST",
+                             "message": f"缺少字段: {e}"}, 400)
+
+
+@router.get("/trust-bundles/imports")
+def list_trust_imports(institution_code: str | None = None):
+    return trust_svc.list_trust_imports(institution_code)
+
+
+@router.post("/trust-bundles/import")
+def import_trust_bundle(body: dict):
+    package = body.get("package", body)
+    result = trust_svc.import_trust_bundle(package, at=body.get("at"))
+    if not result.get("imported"):
+        return JSONResponse(result, status_code=422)
+    return result
+
+
+@router.post("/trust-bundles/verify")
+def verify_trust_bundle_endpoint(body: dict):
+    package = body.get("package", body)
+    try:
+        report = verify_trust_bundle(package, now=body.get("at"),
+                                     allow_expired=bool(body.get("allow_expired")))
+        return report
+    except TrustBundleError as e:
+        return JSONResponse(
+            {"valid": False, "code": e.code, "message": str(e),
+             "problems": e.problems}, 422)
+
+
+@router.post("/receipts/status")
+def receipt_status_endpoint(body: dict):
+    package = body.get("package")
+    if package is None:
+        return JSONResponse({"error": "BAD_REQUEST",
+                             "message": "package 必填"}, 400)
+    return trust_svc.receipt_status(
+        package, at=body.get("at"),
+        institution_code=body.get("institution_code"))
 
 
 # ---- 网页演示端点（持有演示发送方私钥、本地签名后走同一推送管线）-----------

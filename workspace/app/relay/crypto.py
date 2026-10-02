@@ -116,6 +116,7 @@ def receipt_body_fields() -> tuple:
     return (
         "format", "request_key", "institution_code", "institution_title",
         "sender_id", "issued_at", "expires_at", "sessions",
+        "serial_no", "signer_epoch",
     )
 
 
@@ -129,6 +130,135 @@ def verify_receipt_signature(body: dict, signature_hex: str,
     """仅凭回执正文 + 公钥即可离线验签（不访问中继/数据库）。"""
     try:
         msg = canonical({k: body.get(k) for k in receipt_body_fields()})
+        return ed25519.verify(msg, bytes.fromhex(signature_hex),
+                              bytes.fromhex(public_key_hex))
+    except (ValueError, TypeError, ed25519.SignatureError,
+            ed25519.PublicKeyError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 机构签发密钥轮换（连续签名链）/ 撤销清单 / 离线信任包
+# ---------------------------------------------------------------------------
+
+TRUST_BUNDLE_FORMAT = "relay-trust-bundle/v1"
+GENESIS_EPOCH = 0
+
+# 轮换记录参与 record_hash 的固定字段（proposal 时确定，之后不可变）。
+ROTATION_HASH_FIELDS = (
+    "institution_code", "epoch", "public_key", "activate_serial",
+    "proposed_by", "proposed_at", "pop_signature", "prev_record_hash",
+)
+
+
+def epoch_seed_path(code: str, epoch: int) -> Path:
+    return config.key_dir() / f"{code}.e{epoch}.seed"
+
+
+def epoch_pub_path(code: str, epoch: int) -> Path:
+    return config.key_dir() / f"{code}.e{epoch}.pub"
+
+
+def generate_next_keypair() -> tuple[bytes, str]:
+    seed, pub = ed25519.keypair()
+    return seed, pub.hex()
+
+
+def rotation_challenge(code: str, epoch: int, public_key_hex: str,
+                       activate_serial: int) -> bytes:
+    """新钥登记时必须签名的挑战（防误提交他人公钥 / PoP 持有证明）。"""
+    return canonical({
+        "purpose": "relay-key-rotation-pop",
+        "institution_code": code, "epoch": epoch,
+        "public_key": public_key_hex, "activate_serial": activate_serial,
+    })
+
+
+def sign_pop(seed: bytes, code: str, epoch: int, public_key_hex: str,
+             activate_serial: int) -> str:
+    return ed25519.sign(
+        rotation_challenge(code, epoch, public_key_hex, activate_serial),
+        seed).hex()
+
+
+def verify_pop(code: str, epoch: int, public_key_hex: str,
+               activate_serial: int, pop_signature_hex: str) -> bool:
+    try:
+        return ed25519.verify(
+            rotation_challenge(code, epoch, public_key_hex, activate_serial),
+            bytes.fromhex(pop_signature_hex),
+            bytes.fromhex(public_key_hex))
+    except (ValueError, TypeError, ed25519.SignatureError,
+            ed25519.PublicKeyError):
+        return False
+
+
+def rotation_record_hash(record: dict) -> str:
+    return sha256_hex(canonical({k: record.get(k) for k in ROTATION_HASH_FIELDS}))
+
+
+def sign_rotation_approval(record_hash_hex: str, signer_seed: bytes) -> str:
+    msg = b"relay-key-rotation-approval:" + record_hash_hex.encode("ascii")
+    return ed25519.sign(msg, signer_seed).hex()
+
+
+def verify_rotation_approval(record_hash_hex: str, signature_hex: str,
+                             signer_public_key_hex: str) -> bool:
+    msg = b"relay-key-rotation-approval:" + record_hash_hex.encode("ascii")
+    try:
+        return ed25519.verify(msg, bytes.fromhex(signature_hex),
+                              bytes.fromhex(signer_public_key_hex))
+    except (ValueError, TypeError, ed25519.SignatureError,
+            ed25519.PublicKeyError):
+        return False
+
+
+# ---- 版本化撤销清单 -------------------------------------------------------
+
+REVOCATION_HASH_FIELDS = (
+    "institution_code", "version", "prev_digest", "entries", "published_at",
+)
+
+
+def revocation_digest(version_obj: dict) -> str:
+    return sha256_hex(
+        canonical({k: version_obj.get(k) for k in REVOCATION_HASH_FIELDS}))
+
+
+def sign_revocation(digest_hex: str, signer_seed: bytes) -> str:
+    return ed25519.sign(
+        b"relay-revocation:" + digest_hex.encode("ascii"), signer_seed).hex()
+
+
+def verify_revocation_signature(digest_hex: str, signature_hex: str,
+                                public_key_hex: str) -> bool:
+    try:
+        return ed25519.verify(
+            b"relay-revocation:" + digest_hex.encode("ascii"),
+            bytes.fromhex(signature_hex), bytes.fromhex(public_key_hex))
+    except (ValueError, TypeError, ed25519.SignatureError,
+            ed25519.PublicKeyError):
+        return False
+
+
+# ---- 离线信任包 -----------------------------------------------------------
+
+TRUST_BUNDLE_SIGN_FIELDS = (
+    "format", "bundle_serial", "institution_code", "institution_title",
+    "root_epoch", "key_chain", "revocation_versions", "issued_at",
+    "expires_at",
+)
+
+
+def sign_trust_bundle(body: dict, signer_seed: bytes) -> str:
+    msg = canonical({k: body.get(k) for k in TRUST_BUNDLE_SIGN_FIELDS})
+    return ed25519.sign(msg, signer_seed).hex()
+
+
+def verify_trust_bundle_signature(body: dict, signature_hex: str,
+                                  public_key_hex: str) -> bool:
+    try:
+        msg = canonical({k: body.get(k) for k in TRUST_BUNDLE_SIGN_FIELDS})
         return ed25519.verify(msg, bytes.fromhex(signature_hex),
                               bytes.fromhex(public_key_hex))
     except (ValueError, TypeError, ed25519.SignatureError,

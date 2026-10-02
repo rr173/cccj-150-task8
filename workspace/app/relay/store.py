@@ -151,7 +151,103 @@ CREATE TABLE IF NOT EXISTS relay_audit (
     detail_json TEXT,
     created_at  TEXT NOT NULL
 );
+
+-- 机构签发信任根：每机构一行，维护当前生效签发纪元与单调回执序号。
+--  genesis 纪元（epoch=0）的公钥来自既有 {code}.pub，向下兼容。
+CREATE TABLE IF NOT EXISTS relay_institution (
+    institution_code TEXT PRIMARY KEY,
+    active_epoch     INTEGER NOT NULL DEFAULT 0,   -- 当前生效的签发纪元
+    next_serial      INTEGER NOT NULL DEFAULT 1,   -- 机构内单调回执序号（只增）
+    next_bundle_serial INTEGER NOT NULL DEFAULT 1, -- 离线信任包单调版本号
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+
+-- 机构签发密钥轮换记录：连续签名链（旧钥签新钥）。
+--  状态机 PROPOSED -> APPROVED -> ACTIVE；链只包含 APPROVED/ACTIVE 记录。
+CREATE TABLE IF NOT EXISTS relay_key_rotation (
+    id              TEXT PRIMARY KEY,
+    institution_code TEXT NOT NULL,
+    epoch           INTEGER NOT NULL,             -- 新钥纪元号（旧钥 epoch+1）
+    public_key      TEXT NOT NULL,                 -- 下一把公钥（hex）
+    activate_serial INTEGER NOT NULL,              -- 生效水位：新钥首张序号；旧钥可签 < 此值
+    proposed_by     TEXT NOT NULL,
+    approved_by     TEXT,
+    proposer_request_key TEXT,                     -- 登记幂等请求键
+    approver_request_key TEXT,                     -- 批准幂等请求键
+    pop_signature   TEXT NOT NULL,                 -- 新钥对登记挑战的持有证明（PoP）
+    approval_signature TEXT,                       -- 旧钥对整条轮换记录的批准签章
+    record_hash     TEXT NOT NULL,                 -- 固定内容哈希（提案时确定）
+    status          TEXT NOT NULL,                 -- PROPOSED / APPROVED / ACTIVE
+    proposed_at     TEXT NOT NULL,
+    approved_at     TEXT,
+    activated_at    TEXT,
+    UNIQUE(institution_code, epoch),
+    UNIQUE(institution_code, public_key)
+);
+-- 同一机构至多一条未生效（PROPOSED/APPROVED）轮换：并发登记只允许一条胜出。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_rot_pending
+    ON relay_key_rotation(institution_code)
+    WHERE status IN ('PROPOSED', 'APPROVED');
+-- 登记/批准请求键全局幂等（重复请求返回首次结果）。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_rot_proposer_key
+    ON relay_key_rotation(proposer_request_key)
+    WHERE proposer_request_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_rot_approver_key
+    ON relay_key_rotation(approver_request_key)
+    WHERE approver_request_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_relay_rot_inst
+    ON relay_key_rotation(institution_code, epoch);
+
+-- 版本化撤销清单（机构级，只追加）：每版一个完整撤销条目集合。
+CREATE TABLE IF NOT EXISTS relay_revocation (
+    institution_code TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    request_key     TEXT,
+    entries_json    TEXT NOT NULL,                 -- 完整撤销条目（全量并集）
+    entry_count     INTEGER NOT NULL,
+    prev_digest     TEXT,                          -- 上一版摘要（v1 为 null）
+    digest          TEXT NOT NULL,                 -- 本版摘要
+    signer_epoch    INTEGER NOT NULL,              -- 签发时生效的机构密钥纪元
+    signature       TEXT NOT NULL,                 -- 机构生效钥签章
+    published_at    TEXT NOT NULL,
+    note            TEXT,
+    PRIMARY KEY (institution_code, version)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_rev_reqkey
+    ON relay_revocation(request_key)
+    WHERE request_key IS NOT NULL;
+
+-- 离线导入的信任包（机构公钥链/撤销摘要/单调版本号；重导幂等）。
+CREATE TABLE IF NOT EXISTS relay_trust_import (
+    institution_code TEXT NOT NULL,
+    bundle_serial   INTEGER NOT NULL,              -- 信任包自身单调版本号
+    bundle_json     TEXT NOT NULL,
+    active_epoch    INTEGER NOT NULL,
+    revocation_version INTEGER NOT NULL,
+    imported_at     TEXT NOT NULL,
+    PRIMARY KEY (institution_code, bundle_serial)
+);
+
+-- 本地导出的信任包（导出请求键 -> 原包；同键永远返回同一包）。
+CREATE TABLE IF NOT EXISTS relay_trust_export (
+    request_key      TEXT PRIMARY KEY,
+    institution_code TEXT NOT NULL,
+    bundle_serial    INTEGER NOT NULL,
+    package_json     TEXT NOT NULL,
+    created_at       TEXT NOT NULL
+);
 """
+
+
+def _migrate(conn):
+    """增量迁移：为既有库追加新列（幂等）。"""
+    cols = {r["name"] for r in conn.execute(
+        "PRAGMA table_info(relay_receipt)").fetchall()}
+    if "serial_no" not in cols:
+        conn.execute("ALTER TABLE relay_receipt ADD COLUMN serial_no INTEGER")
+    if "signer_epoch" not in cols:
+        conn.execute("ALTER TABLE relay_receipt ADD COLUMN signer_epoch INTEGER")
 
 
 def init_relay_db():
@@ -159,6 +255,7 @@ def init_relay_db():
     conn = get_conn()
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
     finally:
         conn.close()

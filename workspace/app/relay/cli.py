@@ -21,6 +21,9 @@
 
     # 隔离恢复演示：制造同序号异内容→隔离→重开正确链→解除隔离→补齐
     python -m app.relay.cli recovery --sender site-A
+
+    # 机构签发密钥轮换 → 撤销 → 离线信任包全流程（含离线核验与旧回执可验）
+    python -m app.relay.cli rotate-demo --institution DEMO-IN --sender site-A
 """
 from __future__ import annotations
 
@@ -31,8 +34,11 @@ import sys
 from pathlib import Path
 
 from . import config, crypto, ed25519, service
+from . import trust as trust_svc
 from .store import init_relay_db
-from .verifier import verify_receipt_package, ReceiptError
+from .verifier import (verify_receipt_package, ReceiptError,
+                       verify_trust_bundle, TrustBundleError,
+                       check_receipt_against_trust)
 
 
 def sender_key_path(sender_id: str) -> Path:
@@ -224,6 +230,286 @@ def cmd_recovery(args) -> int:
     return 0
 
 
+def _trust(args) -> int:
+    """只读信任视图：轮换链 / 撤销版本。"""
+    if args.trust_action == "rotations":
+        _print(trust_svc.list_rotations(args.institution))
+    else:
+        _print(trust_svc.list_revocations(args.institution))
+    return 0
+
+
+def cmd_rotation(args) -> int:
+    init_relay_db()
+    if args.rot_action == "preview":
+        _print(trust_svc.rotation_preview(
+            args.institution,
+            activate_serial=args.activate_serial,
+            next_public_key=args.next_public_key))
+        return 0
+    if args.rot_action == "propose":
+        _print(trust_svc.propose_rotation(
+            args.institution, request_key=args.request_key,
+            proposed_by=args.proposed_by,
+            activate_serial=args.activate_serial,
+            next_public_key=args.next_public_key,
+            next_seed_hex=args.next_seed_hex,
+            pop_signature=args.pop_signature))
+        return 0
+    if args.rot_action == "approve":
+        _print(trust_svc.approve_rotation(
+            args.institution, request_key=args.request_key,
+            approved_by=args.approved_by, epoch=args.epoch))
+        return 0
+    if args.rot_action == "activate":
+        _print(trust_svc.activate_rotation(args.institution, epoch=args.epoch))
+        return 0
+    _print(trust_svc.list_rotations(args.institution))
+    return 0
+
+
+def cmd_revocation(args) -> int:
+    init_relay_db()
+    if args.rev_action == "publish":
+        entries = None
+        if args.entries_file:
+            entries = json.loads(Path(args.entries_file).read_text("utf-8"))
+        time_range = None
+        if args.issued_from or args.issued_to:
+            time_range = {"issued_from": args.issued_from,
+                          "issued_to": args.issued_to}
+        _print(trust_svc.publish_revocation(
+            args.institution, request_key=args.request_key,
+            receipts=args.receipts or None, entries=entries,
+            time_range=time_range, note=args.note))
+        return 0
+    _print(trust_svc.list_revocations(args.institution))
+    return 0
+
+
+def cmd_trust_bundle(args) -> int:
+    init_relay_db()
+    if args.bundle_action == "export":
+        rp = trust_svc.export_trust_bundle(
+            args.institution, request_key=args.request_key,
+            ttl_seconds=args.ttl)
+        Path(args.out).write_text(
+            json.dumps(rp["package"], ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        print(f"{'重放' if rp['replayed'] else '导出'}离线信任包 -> {args.out}")
+        return 0
+    if args.bundle_action == "verify":
+        pkg = json.loads(Path(args.file).read_text("utf-8"))
+        try:
+            _print(verify_trust_bundle(pkg, now=args.at))
+            return 0
+        except TrustBundleError as exc:
+            _print({"valid": False, "code": exc.code,
+                    "problems": exc.problems})
+            return 1
+    if args.bundle_action == "import":
+        pkg = json.loads(Path(args.file).read_text("utf-8"))
+        r = trust_svc.import_trust_bundle(pkg, at=args.at)
+        _print(r)
+        return 0 if r.get("imported") else 1
+    # check：以信任包为根定位回执（离线）
+    bundle = json.loads(Path(args.trust).read_text("utf-8"))
+    receipt = json.loads(Path(args.file).read_text("utf-8"))
+    try:
+        verify_trust_bundle(bundle, now=args.at)
+    except TrustBundleError as exc:
+        _print({"valid": False, "stage": "TRUST_BUNDLE",
+                "problems": exc.problems})
+        return 1
+    d = check_receipt_against_trust(receipt, bundle, now=args.at)
+    _print(d)
+    return 0 if d["status"] == "VALID" else 1
+
+
+def cmd_rotate_demo(args) -> int:
+    """全流程：旧钥签回执→登记/批准新钥→水位生效→新旧钥各自可验→
+    撤销旧回执→导出/导入信任包→离线核验定位（含断链/回滚拒绝）。"""
+    init_relay_db()
+    inst = args.institution
+    crypto.create_institution_keys(inst, overwrite=False)
+    seed, _ = load_or_create_sender(args.sender)
+    sid = args.session
+
+    def push_chain(spec, session):
+        events, prev = [], None
+        for i, (et, ver, st, det) in enumerate(spec, start=1):
+            events.append(make_event(
+                seed, sender_id=args.sender, session_id=session, revision=i,
+                event_type=et, session_version=ver, state=st,
+                prev_event_hash=prev,
+                occurred_at=f"2026-10-02T20:00:{i:02d}Z", detail=det))
+            prev = events[-1]["event_hash"]
+        service.push_events(args.sender, events, batch_id=f"{session}-chain")
+        return events
+
+    spec = [
+        ("CREATE", 1, "UPLOADING", None),
+        ("CHUNK_ACCEPTED", 1, "UPLOADING", {"seq": 1}),
+        ("FINALIZE_ACCEPTED", 2, "IMPORTED", {"imported_versions": 1}),
+    ]
+    events = push_chain(spec, sid)
+
+    print("== 1) 轮换预演（只读，不改状态）==")
+    preview = trust_svc.rotation_preview(inst)
+    _print(preview)
+    assert preview["active_epoch"] == 0
+    assert preview["next_serial"] == 1
+
+    print("== 2) 旧钥签发回执 serial=1（轮换前的历史回执）==")
+    old = service.export_receipt(
+        request_key="ROTDEMO-R1", institution_code=inst,
+        sender_id=args.sender, ttl_seconds=3600)["package"]
+    assert old["body"]["serial_no"] == 1 and old["body"]["signer_epoch"] == 0
+    Path(f"{args.out_prefix}.old.json").write_text(
+        json.dumps(old, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print("== 3) 管理员 A 登记下一把公钥，生效水位=3（同键重放幂等）==")
+    prop = trust_svc.propose_rotation(
+        inst, request_key="ROTDEMO-PROP-1", proposed_by="admin-A",
+        activate_serial=3)
+    _print({"epoch": prop["rotation"]["epoch"],
+            "status": prop["rotation"]["status"],
+            "activate_serial": prop["rotation"]["activate_serial"]})
+    prop_again = trust_svc.propose_rotation(
+        inst, request_key="ROTDEMO-PROP-1", proposed_by="admin-A",
+        activate_serial=3)
+    assert prop_again["replayed"] is True
+    new_epoch = prop["rotation"]["epoch"]
+
+    print("== 4) 同一管理员不能自批；管理员 B 批准（不同键并发只一个生效）==")
+    try:
+        trust_svc.approve_rotation(
+            inst, request_key="ROTDEMO-APPR-SELF", approved_by="admin-A")
+        raise AssertionError("自批必须被拒绝")
+    except trust_svc.TrustError as e:
+        print("自批拒绝:", e.code)
+    appr = trust_svc.approve_rotation(
+        inst, request_key="ROTDEMO-APPR-1", approved_by="admin-B")
+    _print({"epoch": appr["rotation"]["epoch"],
+            "status": appr["rotation"]["status"]})
+    # 管理员 C 用不同批准键并发批准：必须落败，首个结果保持生效
+    try:
+        trust_svc.approve_rotation(
+            inst, request_key="ROTDEMO-APPR-2", approved_by="admin-C")
+        raise AssertionError("并发批准必须只有一个生效")
+    except trust_svc.TrustError as e:
+        print("并发批准拒绝:", e.code, "→ 胜出:", e.extra.get("approved_by"))
+        assert e.code == "APPROVAL_RACE"
+    # 管理员 B 用同一批准键重放：返回首次结果（幂等）
+    appr_replay = trust_svc.approve_rotation(
+        inst, request_key="ROTDEMO-APPR-1", approved_by="admin-B")
+    assert appr_replay["replayed"] is True
+
+    print("== 5) serial=2 仍由旧钥（epoch0）签发；serial=3 起强制新钥 ==")
+    mid = service.export_receipt(
+        request_key="ROTDEMO-R2", institution_code=inst,
+        sender_id=args.sender, ttl_seconds=3600)["package"]
+    assert mid["body"]["serial_no"] == 2 and mid["body"]["signer_epoch"] == 0
+    new = service.export_receipt(
+        request_key="ROTDEMO-R3", institution_code=inst,
+        sender_id=args.sender, ttl_seconds=3600)["package"]
+    assert new["body"]["serial_no"] == 3 and \
+        new["body"]["signer_epoch"] == new_epoch
+    Path(f"{args.out_prefix}.new.json").write_text(
+        json.dumps(new, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"旧钥回执 serial=1/2 继续可独立验证；新钥 serial=3 epoch={new_epoch}")
+
+    print("== 6) 重启模拟：重新打开库，链状态不回退、不重复切换 ==")
+    view = trust_svc.list_rotations(inst)
+    _print({"active_epoch": view["active_epoch"],
+            "next_serial": view["next_serial"],
+            "statuses": [(r["epoch"], r["status"]) for r in view["rotations"]]})
+    assert view["active_epoch"] == new_epoch
+
+    print("== 7) 按回执标识撤销 serial=1 的旧回执（撤销清单 v2）==")
+    rev = trust_svc.publish_revocation(
+        inst, request_key="ROTDEMO-REV-1",
+        receipts=["ROTDEMO-R1"], note="误签回执撤销")
+    _print({"version": rev["revocation"]["version"],
+            "total_entries": rev["total_entries"],
+            "added": len(rev["added_entries"])})
+
+    print("== 8) 导出离线信任包（公钥链+撤销版本+单调包序号）==")
+    bundle = trust_svc.export_trust_bundle(
+        inst, request_key="ROTDEMO-BUNDLE-1")["package"]
+    bp = Path(f"{args.out_prefix}.trust.json")
+    bp.write_text(json.dumps(bundle, ensure_ascii=False, indent=2),
+                  encoding="utf-8")
+    report = verify_trust_bundle(bundle)
+    _print({"active_epoch": report["active_epoch"],
+            "revocation_version": report["revocation_version"],
+            "bundle_serial": report["bundle_serial"]})
+
+    print("== 9) 导入信任包（幂等）+ 完全离线核验：旧回执已撤销 ==")
+    _print(trust_svc.import_trust_bundle(bundle))
+    d_old = check_receipt_against_trust(old, bundle)
+    _print({"old_receipt": d_old["status"], "code": d_old["code"],
+            "revocations": d_old["revocations"]})
+    assert d_old["status"] == "REVOKED"
+
+    print("== 10) 未撤销的历史回执 serial=2 与新钥回执 serial=3 仍 VALID ==")
+    d_mid = check_receipt_against_trust(mid, bundle)
+    d_new = check_receipt_against_trust(new, bundle)
+    _print({"serial2": d_mid["status"], "serial3": d_new["status"]})
+    assert d_mid["status"] == "VALID" and d_new["status"] == "VALID"
+
+    print("== 11) 篡改轮换链（断链）→ 离线核验可定位拒绝 ==")
+    bad = json.loads(json.dumps(bundle))
+    bad["body"]["key_chain"][1]["prev_record_hash"] = "00" * 32
+    try:
+        verify_trust_bundle(bad)
+        raise AssertionError("断链必须被拒绝")
+    except TrustBundleError as e:
+        codes = {p["code"] for p in e.problems}
+        print("断链拒绝:", codes)
+        assert "ROTATION_CHAIN_BROKEN" in codes
+
+    print("== 12) 撤销摘要回滚检测（逐版签名合法但新版是旧版子集）==")
+    # 信任包整体签名覆盖全部内容，任何篡改都先表现为 BAD_TRUST_SIGNATURE；
+    # 真正的"回滚"威胁是机构侧（或其历史签名钥被滥用）重新发布一个
+    # **逐版签名都合法**却更短的版本序列——离线超集检查在此定位。
+    rb = json.loads(json.dumps(bundle))
+    new_seed = bytes.fromhex(
+        crypto.epoch_seed_path(inst, new_epoch).read_text().strip())
+    versions = rb["body"]["revocation_versions"]
+    # 构造 v1(空) -> v2(真实撤销) -> v3(伪造空集)：每版摘要/签名都合法，
+    # 但 v3 是 v2 的真子集，超集单调检查必须定位 REVOCATION_ROLLBACK。
+    forged = [dict(versions[0]), dict(versions[1])]
+    rollback_obj = {
+        "institution_code": inst, "version": 3,
+        "prev_digest": forged[-1]["digest"], "entries": [],
+        "published_at": "2026-10-03T00:00:00.000Z"}
+    dg = crypto.revocation_digest(rollback_obj)
+    forged.append({"institution_code": inst, "version": 3,
+                   "prev_digest": rollback_obj["prev_digest"],
+                   "entries": [], "digest": dg,
+                   "published_at": rollback_obj["published_at"],
+                   "signer_epoch": new_epoch,
+                   "signature": crypto.sign_revocation(dg, new_seed)})
+    rb["body"]["revocation_versions"] = forged
+    try:
+        verify_trust_bundle(rb)
+        raise AssertionError("撤销回滚必须被拒绝")
+    except TrustBundleError as e:
+        codes = {p["code"] for p in e.problems}
+        print("回滚拒绝:", codes)
+        assert "REVOCATION_ROLLBACK" in codes
+
+    print("== 13) 过期信任包 → 定位拒绝（核验时刻注入未来时间）==")
+    r = check_receipt_against_trust(
+        new, bundle, now="2099-01-01T00:00:00Z")
+    _print({"future_check": r["status"], "code": r["code"]})
+    assert r["status"] == "TRUST_EXPIRED"
+
+    print(f"产物: {args.out_prefix}.old.json / .new.json / .trust.json")
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="app.relay.cli",
@@ -253,6 +539,74 @@ def main(argv=None) -> int:
 
     p_recov = sub.add_parser("recovery", help="隔离与恢复演示")
     p_recov.set_defaults(func=cmd_recovery)
+
+    # -- 机构签发密钥轮换 --
+    p_rot = sub.add_parser("rotation", help="签发密钥轮换：预演/登记/批准/生效")
+    rot_sub = p_rot.add_subparsers(dest="rot_action", required=True)
+    rp = rot_sub.add_parser("preview")
+    rp.add_argument("--activate-serial", type=int)
+    rp.add_argument("--next-public-key")
+    rp.set_defaults(func=cmd_rotation)
+    rp = rot_sub.add_parser("propose")
+    rp.add_argument("--request-key", required=True)
+    rp.add_argument("--proposed-by", required=True)
+    rp.add_argument("--activate-serial", type=int, required=True)
+    rp.add_argument("--next-public-key")
+    rp.add_argument("--next-seed-hex")
+    rp.add_argument("--pop-signature")
+    rp.set_defaults(func=cmd_rotation)
+    rp = rot_sub.add_parser("approve")
+    rp.add_argument("--request-key", required=True)
+    rp.add_argument("--approved-by", required=True)
+    rp.add_argument("--epoch", type=int)
+    rp.set_defaults(func=cmd_rotation)
+    rp = rot_sub.add_parser("activate")
+    rp.add_argument("--epoch", type=int)
+    rp.set_defaults(func=cmd_rotation)
+    rp = rot_sub.add_parser("list")
+    rp.set_defaults(func=cmd_rotation)
+
+    # -- 回执撤销 --
+    p_rev = sub.add_parser("revocation", help="版本化撤销清单：发布/列表")
+    rev_sub = p_rev.add_subparsers(dest="rev_action", required=True)
+    rp = rev_sub.add_parser("publish")
+    rp.add_argument("--request-key", required=True)
+    rp.add_argument("--receipts", nargs="*", help="按回执请求键撤销")
+    rp.add_argument("--entries-file", help="显式撤销条目 JSON 数组")
+    rp.add_argument("--issued-from")
+    rp.add_argument("--issued-to")
+    rp.add_argument("--note")
+    rp.set_defaults(func=cmd_revocation)
+    rp = rev_sub.add_parser("list")
+    rp.set_defaults(func=cmd_revocation)
+
+    # -- 离线信任包 --
+    p_tb = sub.add_parser("trust", help="离线信任包：导出/导入/核验/对照回执")
+    tb_sub = p_tb.add_subparsers(dest="bundle_action", required=True)
+    rp = tb_sub.add_parser("export")
+    rp.add_argument("--request-key", required=True)
+    rp.add_argument("--ttl", type=int)
+    rp.add_argument("--out", required=True)
+    rp.set_defaults(func=cmd_trust_bundle)
+    rp = tb_sub.add_parser("verify")
+    rp.add_argument("file")
+    rp.add_argument("--at")
+    rp.set_defaults(func=cmd_trust_bundle)
+    rp = tb_sub.add_parser("import")
+    rp.add_argument("file")
+    rp.add_argument("--at")
+    rp.set_defaults(func=cmd_trust_bundle)
+    rp = tb_sub.add_parser("check", help="信任包为根离线定位回执")
+    rp.add_argument("--trust", required=True)
+    rp.add_argument("file")
+    rp.add_argument("--at")
+    rp.set_defaults(func=cmd_trust_bundle)
+
+    p_rdemo = sub.add_parser("rotate-demo",
+                             help="密钥轮换→撤销→信任包全流程离线演示")
+    p_rdemo.add_argument("--session", default="PKG-ROT")
+    p_rdemo.add_argument("--out-prefix", default="/tmp/relay-rotate")
+    p_rdemo.set_defaults(func=cmd_rotate_demo)
 
     args = parser.parse_args(argv)
     return args.func(args)
