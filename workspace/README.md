@@ -15,7 +15,7 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 运行测试：
 
 ```bash
-python3 -m pytest tests/ -q          # 192 项：业务规则 + HTTP 集成 + 回执中继（水位/隔离/回执/租约/并发/CLI/RFC8032）
+python3 -m pytest tests/ -q          # 业务规则 + HTTP 集成 + 回执中继（水位/隔离/回执/租约/并发/CLI/RFC8032/密钥轮换/撤销/离线信任包）
 python3 demo_live.py                 # 完整 HTTP 端到端演示（需先启动服务并 seed）
 
 # 交换包交付回执中继：命令行模拟器 / 独立核验器（可不启动 HTTP 直连库演示）
@@ -249,6 +249,32 @@ POST /api/snapshots/imports-cleanup         保留期清理（仅冻结超期且
   → prev 链连续 → 修订号 1..N 连续且长度 == 水位 → chain_digest/head
   → 拒绝明细与链一致。`python -m app.relay.verifier 包.json [--at ISO]`。
 
+**机构签发密钥轮换、回执撤销与离线信任包**
+
+* **轮换水位**：回执正文带机构内单调 `receipt_serial` 与 `signing_key_seq`。
+  机构可用幂等 `request_key` 预演/登记下一把 Ed25519 公钥及生效回执水位；
+  批准后，`serial < watermark` 的历史回执继续按旧钥验证，达到水位后新回执
+  必须由新钥签发。切换在签发回执的同一 `BEGIN IMMEDIATE` 事务内完成，
+  服务重启或响应丢失重放不会回退、不会重复切换。
+* **连续签名链**：`relay_key_rotation` 只追加根钥与每一把轮换钥。根记录自签，
+  后续记录含上一条 `record_hash` 并由上一把机构钥签名；外部登记的新公钥还须
+  提交新私钥对登记声明的自签证明。核验器重算记录哈希、prev 链接与两级签名，
+  断链给出 `key_seq/at_index/expected_prev/actual_prev`。
+* **并发行政动作**：登记/批准/撤销/发布/导入均持久化 `request_key` 指纹。
+  同键同内容重放返回首次结果；同键异内容 `REQUEST_KEY_CONFLICT`。两个管理员
+  并发登记只有一个打开的轮换存在；并发批准同一 `PROPOSED` 记录只有一个成功，
+  另一个得到 `ROTATION_NOT_PROPOSED/ROTATION_APPROVE_CONFLICT`，不会二次切换。
+* **版本化撤销**：可按回执标识或签发时间区间发布撤销清单；新版本必须携带上一
+  版本清单哈希，且撤销集合只能扩大不能缩小。离线核验器检测
+  `REVOCATION_LIST_ROLLBACK`、`REVOCATION_ENTRIES_ROLLED_BACK`、清单/条目摘要
+  不一致和错误签发钥；已撤销回执返回 `RECEIPT_REVOKED` 或
+  `RECEIPT_REVOKED_BY_TIME_RANGE`，未撤销历史回执仍可按其原签发钥验证。
+* **离线信任包**：`relay-trust/v1` 包含机构公钥链、当前撤销集合、全部版本化
+  撤销清单、撤销摘要、单调 `trust_version` 与有效期，并由当前机构钥签名。
+  过期信任包 (`TRUST_PACKAGE_EXPIRED`)、断链轮换、撤销回滚、已撤销回执都会
+  产生带机构/版本/序号/哈希的可定位拒绝。导入端先完整离线验包，再拒绝
+  `trust_version` 回滚；同版本同摘要导入幂等。
+
 **清理授权（发送方清本地事件前的闸门）**
 
 发送方凭回执包 + 本地事件清单调 `/cleanup-authorization`，只有同时满足
@@ -275,20 +301,31 @@ GET  /api/relay/sessions[?sender_id=]        水位/隔离/租约总览
 GET  /api/relay/sessions/{sender}/{session}  会话详情（已确认链/缺口/待补修订/隔离差异/拒绝明细）
 POST /api/relay/sessions/{sender}/{session}/release-quarantine  撤回误版（未确认原始事件）并解除隔离、重跑推进
 POST /api/relay/claim | /release-lease       工作实例领取/释放单会话处理租约（TTL 接管）
-POST /api/relay/receipts                     导出/同键重放签名回执包（水位+摘要+拒绝明细+有效期）
+POST /api/relay/institutions/{code}/rotations/preview          轮换预演（当前/下一把钥、下一回执水位、切换区间）
+POST /api/relay/institutions/{code}/rotations                  幂等登记下一把公钥与生效水位
+POST /api/relay/institutions/{code}/rotations/{seq}/approve    管理员批准（并发只有一个成功）
+POST /api/relay/institutions/{code}/rotations/{seq}/activate   达到水位后显式生效/检查切换
+POST /api/relay/institutions/{code}/revocations                按回执 ID 或签发时间区间发布版本化撤销清单
+GET  /api/relay/institutions/{code}/receipts/{id}/status       查看回执 VALID/EXPIRED/REVOKED 与撤销证据
+POST /api/relay/institutions/{code}/trust-packages             发布离线信任包（公钥链+撤销摘要+单调版本）
+POST /api/relay/trust-packages/verify                          完全离线核验信任包
+POST /api/relay/trust-packages/import                          先离线验包再导入；拒绝版本回滚，同版本幂等
+POST /api/relay/receipts                     导出/同键重放签名回执包（水位+摘要+拒绝明细+有效期+签发序号/钥）
 GET  /api/relay/receipts                     已签发回执清单
-POST /api/relay/receipts/verify              上传回执包核验（签章/哈希链/有效期/水位）
+POST /api/relay/receipts/verify              上传回执包核验；可带 trust_package 做轮换/撤销离线核验
 POST /api/relay/cleanup-authorization        凭回执申请本地事件清理授权（过期/摘要变化拒绝）
 POST /api/relay/demo/*                       网页演示端点（演示私钥本地签名后走同一推送管线）
 ```
 
 网页界面 `/relay`：左栏会话水位点阵（绿已确认/黄等待前序/灰缺口/隔离红），
-中栏确认哈希链、**隔离原因与可定位差异**、撤回误版恢复，右栏四页签：
+中栏确认哈希链、**隔离原因与可定位差异**、撤回误版恢复，右栏五页签：
 回执签发与 `.receipt.json` 下载（同键重放校验字节一致）、**上传回执包
 核验**、清理授权（一键把本地事件哈希篡改为 `ff…` 演示拒绝）、两实例并发
-领取租约；顶部按钮一键演示乱序缺口→补传→批量重放完成→制造同序号异内容
+领取租约、**机构信任**（轮换预演/登记/批准/生效、撤销、发布/导入/核验
+信任包、查看回执状态）；顶部按钮一键演示乱序缺口→补传→批量重放完成→制造同序号异内容
 隔离（旁边 `PKG-HEALTHY` 保持健康）→撤回误版恢复。命令行模拟器
-`python -m app.relay.cli demo|recovery|push|receipt` 走完全相同的服务管线。
+`python -m app.relay.cli demo|recovery|push|receipt|rotation-preview|rotation-register|rotation-approve|rotation-activate|revoke|trust-export|trust-import|status|offline-verify`
+走完全相同的服务管线。
 
 ### 回执中继坐标与目录（`app/relay/config.py`）
 
@@ -298,6 +335,7 @@ POST /api/relay/demo/*                       网页演示端点（演示私钥�
 | `RELAY_KEY_DIR` | `data/relay/keys` | 接收机构 seed(0600)/公钥 |
 | `RELAY_RECEIPT_DIR` | `data/relay/receipts` | 回执包导出目录 |
 | `RELAY_RECEIPT_TTL_SECONDS` | 604800（7 天） | 回执默认有效期 |
+| `RELAY_TRUST_TTL_SECONDS` | 604800（7 天） | 离线信任包默认有效期 |
 | `RELAY_LEASE_TTL_SECONDS` | 30 | 工作实例领取租约 TTL（崩溃接管） |
 
 ### 接收窗口与移交（负责人 / 有效期 / 冻结 / 重开 / 保留期）

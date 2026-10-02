@@ -37,11 +37,12 @@ CONFLICT_SPEC = [
 
 
 def ensure_demo_institution():
-    from . import crypto
+    from . import crypto, trust
     try:
         crypto.create_institution_keys(DEMO_INSTITUTION, overwrite=False)
     except crypto.KeyExistsError:
         pass
+    trust.init_institution_state(DEMO_INSTITUTION, "演示机构")
 
 
 def ensure_demo_sender(sender_id: str = HAPPY_SENDER) -> dict:

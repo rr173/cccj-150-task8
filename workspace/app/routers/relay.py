@@ -5,15 +5,22 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from ..services.ids import now_iso
-from ..relay import service, crypto
+from ..relay import service, crypto, trust as trust_svc
 from ..relay import demo as demo_svc
 from ..relay.store import init_relay_db
-from ..relay.verifier import verify_receipt_package, ReceiptError
+from ..relay.verifier import (
+    verify_receipt_package, verify_trust_package, ReceiptError)
 
 router = APIRouter(prefix="/api/relay", tags=["relay"])
 
 
 def _err(exc: service.RelayError) -> JSONResponse:
+    payload = {"error": exc.code, "message": str(exc)}
+    payload.update(exc.extra)
+    return JSONResponse(payload, status_code=exc.status)
+
+
+def _trust_err(exc: trust_svc.TrustError) -> JSONResponse:
     payload = {"error": exc.code, "message": str(exc)}
     payload.update(exc.extra)
     return JSONResponse(payload, status_code=exc.status)
@@ -33,11 +40,141 @@ def create_institution(body: dict):
         return JSONResponse({"error": "BAD_REQUEST",
                              "message": "institution_code 必填"}, 400)
     try:
-        return crypto.create_institution_keys(
+        result = crypto.create_institution_keys(
             code, overwrite=bool(body.get("overwrite")))
-    except crypto.KeyExistsError as exc:
+        trust_svc.init_institution_state(code, body.get("title"))
+        return result
+    except (crypto.KeyExistsError, trust_svc.TrustError) as exc:
+        if isinstance(exc, trust_svc.TrustError):
+            return _trust_err(exc)
         return _err(service.RelayError(str(exc), "INSTITUTION_EXISTS", 409))
 
+
+# ---- 机构密钥轮换 / 撤销 / 信任包 -----------------------------------------
+
+@router.get("/institutions/{code}/trust")
+def institution_trust(code: str):
+    try:
+        return trust_svc.institution_trust_status(code)
+    except trust_svc.TrustError as e:
+        return _trust_err(e)
+
+
+@router.post("/institutions/{code}/rotations/preview")
+def rotation_preview(code: str, body: dict | None = None):
+    body = body or {}
+    try:
+        return trust_svc.rotation_preview(
+            code, effective_watermark=body["effective_watermark"],
+            public_key=body.get("public_key"))
+    except trust_svc.TrustError as e:
+        return _trust_err(e)
+    except KeyError as e:
+        return JSONResponse({"error": "BAD_REQUEST",
+                             "message": f"缺少字段: {e}"}, 400)
+
+
+@router.post("/institutions/{code}/rotations")
+def register_rotation(code: str, body: dict):
+    try:
+        return trust_svc.register_rotation(
+            institution_code=code, request_key=body["request_key"],
+            effective_watermark=body["effective_watermark"],
+            public_key=body.get("public_key"),
+            new_key_self_signature=body.get("new_key_self_signature"),
+            registered_by=body.get("registered_by"),
+            title=body.get("title"))
+    except trust_svc.TrustError as e:
+        return _trust_err(e)
+    except KeyError as e:
+        return JSONResponse({"error": "BAD_REQUEST",
+                             "message": f"缺少字段: {e}"}, 400)
+
+
+@router.post("/institutions/{code}/rotations/{key_seq}/approve")
+def approve_rotation(code: str, key_seq: int, body: dict):
+    try:
+        return trust_svc.approve_rotation(
+            institution_code=code, key_seq=key_seq,
+            approver=body.get("approver", "admin"),
+            request_key=body["request_key"])
+    except trust_svc.TrustError as e:
+        return _trust_err(e)
+    except KeyError as e:
+        return JSONResponse({"error": "BAD_REQUEST",
+                             "message": f"缺少字段: {e}"}, 400)
+
+
+@router.post("/institutions/{code}/rotations/{key_seq}/activate")
+def activate_rotation(code: str, key_seq: int, body: dict | None = None):
+    body = body or {}
+    try:
+        return trust_svc.activate_rotation(
+            institution_code=code, key_seq=key_seq,
+            request_key=body.get("request_key"), actor=body.get("actor"))
+    except trust_svc.TrustError as e:
+        return _trust_err(e)
+
+
+@router.post("/institutions/{code}/revocations")
+def publish_revocation(code: str, body: dict):
+    try:
+        return trust_svc.publish_revocation(
+            institution_code=code, request_key=body["request_key"],
+            receipt_ids=body.get("receipt_ids"),
+            issued_from=body.get("issued_from"),
+            issued_to=body.get("issued_to"),
+            reason=body.get("reason", "REVOKED"),
+            published_by=body.get("published_by"))
+    except trust_svc.TrustError as e:
+        return _trust_err(e)
+    except KeyError as e:
+        return JSONResponse({"error": "BAD_REQUEST",
+                             "message": f"缺少字段: {e}"}, 400)
+
+
+@router.get("/institutions/{code}/receipts/{receipt_id}/status")
+def receipt_status(code: str, receipt_id: str, at: str | None = None):
+    try:
+        return trust_svc.receipt_status(code, receipt_id, at)
+    except trust_svc.TrustError as e:
+        return _trust_err(e)
+
+
+@router.post("/institutions/{code}/trust-packages")
+def export_trust(code: str, body: dict):
+    try:
+        return trust_svc.export_trust_package(
+            institution_code=code, request_key=body["request_key"],
+            ttl_seconds=body.get("ttl_seconds"),
+            issued_by=body.get("issued_by"))
+    except trust_svc.TrustError as e:
+        return _trust_err(e)
+    except KeyError as e:
+        return JSONResponse({"error": "BAD_REQUEST",
+                             "message": f"缺少字段: {e}"}, 400)
+
+
+@router.post("/trust-packages/verify")
+def verify_trust(body: dict, at: str | None = None):
+    package = body.get("package", body)
+    try:
+        return verify_trust_package(package, now=at,
+                                    min_trust_version=body.get("min_trust_version"))
+    except ReceiptError as e:
+        return JSONResponse(
+            {"valid": False, "code": e.code, "message": str(e),
+             "problems": e.problems}, 422)
+
+
+@router.post("/trust-packages/import")
+def import_trust(body: dict):
+    package = body.get("package", body)
+    try:
+        return trust_svc.import_trust_package(
+            package, request_key=body.get("request_key"), at=body.get("at"))
+    except trust_svc.TrustError as e:
+        return _trust_err(e)
 
 # ---- 发送方 -------------------------------------------------------------
 
@@ -149,8 +286,9 @@ def verify_uploaded_receipt(body: dict, at: str | None = None):
     """上传一个回执包做在线/离线核验（也可用独立核验器命令行）。"""
     package = body.get("package", body)
     try:
-        return verify_receipt_package(package, now=at,
-                                      min_watermark=body.get("min_watermark"))
+        return verify_receipt_package(
+            package, now=at, min_watermark=body.get("min_watermark"),
+            trust_package=body.get("trust_package"))
     except ReceiptError as e:
         return JSONResponse(
             {"valid": False, "code": e.code, "message": str(e),

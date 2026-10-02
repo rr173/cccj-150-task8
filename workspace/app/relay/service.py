@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from dataclasses import dataclass
 
 from . import config, crypto
@@ -767,10 +768,11 @@ def export_receipt(*, request_key: str, institution_code: str,
                    session_ids: list[str] | None = None) -> dict:
     """导出（或重放）签名回执包。同 request_key 永远返回同一原包。"""
     init_relay_db()
-    seed = crypto.load_institution_seed(institution_code)
-    ttl = ttl_seconds if ttl_seconds is not None else config.RECEIPT_TTL_SECONDS
+    from .trust import ensure_institution, _auto_activate_due
     from datetime import datetime, timedelta, timezone
+    ttl = ttl_seconds if ttl_seconds is not None else config.RECEIPT_TTL_SECONDS
     with tx() as conn:
+        state = ensure_institution(conn, institution_code, institution_title)
         existing = conn.execute(
             "SELECT * FROM relay_receipt WHERE request_key=?",
             (request_key,)).fetchone()
@@ -784,6 +786,15 @@ def export_receipt(*, request_key: str, institution_code: str,
                     "REQUEST_KEY_CONFLICT", 409)
             return {"replayed": True, "package": pkg}
 
+        # 若已批准轮换的生效水位就是本回执序号，则在同一事务内先切换签发钥；
+        # 重启/重放时已有 request_key 行短路，序号和 active key 都不会回退。
+        _auto_activate_due(conn, institution_code, state)
+        state = conn.execute(
+            "SELECT * FROM relay_institution_state WHERE institution_code=?",
+            (institution_code,)).fetchone()
+        serial = state["next_receipt_serial"]
+        signing_seq = state["current_key_seq"]
+
         # 选会话：显式列表或该发送方全部
         if session_ids is None:
             sids = [r["session_id"] for r in conn.execute(
@@ -795,44 +806,65 @@ def export_receipt(*, request_key: str, institution_code: str,
         now_dt = datetime.now(timezone.utc)
         issued_at = now_dt.strftime("%Y-%m-%dT%H:%M:%S.") + \
                     f"{now_dt.microsecond // 1000:03d}Z"
-        expires_at = (now_dt + timedelta(seconds=ttl)).strftime(
-            "%Y-%m-%dT%H:%M:%S.") + f"{(now_dt + timedelta(seconds=ttl)).microsecond // 1000:03d}Z"
+        expires_dt = now_dt + timedelta(seconds=ttl)
+        expires_at = expires_dt.strftime("%Y-%m-%dT%H:%M:%S.") + \
+                     f"{expires_dt.microsecond // 1000:03d}Z"
+        seed = crypto.load_institution_seed(institution_code, signing_seq)
+        signing_pub = crypto.load_institution_public(institution_code, signing_seq)
         body = {
             "format": crypto.RECEIPT_FORMAT,
             "request_key": request_key,
+            "receipt_id": request_key,
+            "receipt_serial": serial,
             "institution_code": institution_code,
             "institution_title": institution_title or institution_code,
             "sender_id": sender_id,
             "issued_at": issued_at,
             "expires_at": expires_at,
             "sessions": snapshots,
+            "signing_key_seq": signing_seq,
+            "signing_public_key": signing_pub,
         }
         signature = crypto.sign_receipt(body, seed)
-        pubkey = crypto.load_institution_public(institution_code)
+        root_pub = crypto.load_institution_public(institution_code, 0)
         package = {
             "body": body,
-            "institution_public_key": pubkey,
+            # 兼容旧核验器：顶层公钥即本包实际签发钥。
+            "institution_public_key": signing_pub,
+            "root_institution_public_key": root_pub,
             "signature": signature,
         }
         pkg_json = json.dumps(package, ensure_ascii=False, default=str)
+        try:
+            conn.execute(
+                "INSERT INTO relay_receipt(request_key,institution_code,sender_id,"
+                "sessions_json,package_json,signature,issued_at,expires_at,"
+                "created_at,receipt_serial,signing_key_seq,signing_public_key)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (request_key, institution_code, sender_id,
+                 json.dumps(sids, ensure_ascii=False), pkg_json, signature,
+                 issued_at, expires_at, now_iso(), serial, signing_seq,
+                 signing_pub))
+        except sqlite3.IntegrityError as exc:
+            raise RelayError("相同导出请求键并发冲突", "REQUEST_KEY_CONFLICT",
+                             409) from exc
         conn.execute(
-            "INSERT INTO relay_receipt(request_key,institution_code,sender_id,"
-            "sessions_json,package_json,signature,issued_at,expires_at,created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?)",
-            (request_key, institution_code, sender_id,
-             json.dumps(sids, ensure_ascii=False), pkg_json, signature,
-             issued_at, expires_at, now_iso()))
+            "UPDATE relay_institution_state SET next_receipt_serial=?,"
+            "updated_at=? WHERE institution_code=?",
+            (serial + 1, now_iso(), institution_code))
         audit(conn, "RECEIPT_EXPORT", sender_id=sender_id,
               detail={"request_key": request_key,
                       "institution": institution_code,
-                      "sessions": sids})
+                      "sessions": sids, "receipt_serial": serial,
+                      "signing_key_seq": signing_seq})
         return {"replayed": False, "package": package}
 
 
 def list_receipts(sender_id: str | None = None) -> list[dict]:
     with tx() as conn:
         sql = ("SELECT request_key,institution_code,sender_id,issued_at,"
-               "expires_at,sessions_json FROM relay_receipt")
+               "expires_at,sessions_json,receipt_serial,signing_key_seq "
+               "FROM relay_receipt")
         args = ()
         if sender_id:
             sql += " WHERE sender_id=?"

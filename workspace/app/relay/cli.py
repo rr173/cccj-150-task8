@@ -21,6 +21,18 @@
 
     # 隔离恢复演示：制造同序号异内容→隔离→重开正确链→解除隔离→补齐
     python -m app.relay.cli recovery --sender site-A
+
+    # 机构密钥轮换 / 撤销 / 离线信任包
+    python -m app.relay.cli --institution DEMO-IN rotation-preview --watermark 8
+    python -m app.relay.cli --institution DEMO-IN rotation-register \
+        --request-key ROT-1 --watermark 8
+    python -m app.relay.cli --institution DEMO-IN rotation-approve \
+        --key-seq 1 --request-key APP-1
+    python -m app.relay.cli --institution DEMO-IN revoke \
+        --request-key REV-1 --receipt-id REQ-1 --reason MISISSUED
+    python -m app.relay.cli --institution DEMO-IN trust-export \
+        --request-key TRUST-1 --out trust.json
+    python -m app.relay.verifier receipt.json --trust trust.json
 """
 from __future__ import annotations
 
@@ -30,9 +42,10 @@ import os
 import sys
 from pathlib import Path
 
-from . import config, crypto, ed25519, service
+from . import config, crypto, ed25519, service, trust
 from .store import init_relay_db
-from .verifier import verify_receipt_package, ReceiptError
+from .verifier import (
+    verify_receipt_package, verify_trust_package, ReceiptError)
 
 
 def sender_key_path(sender_id: str) -> Path:
@@ -163,6 +176,103 @@ def cmd_receipt(args) -> int:
     return 0
 
 
+
+def cmd_rotation_preview(args) -> int:
+    init_relay_db()
+    _print(trust.rotation_preview(
+        args.institution, effective_watermark=args.watermark,
+        public_key=args.public_key))
+    return 0
+
+
+def cmd_rotation_register(args) -> int:
+    init_relay_db()
+    _print(trust.register_rotation(
+        institution_code=args.institution, request_key=args.request_key,
+        effective_watermark=args.watermark, public_key=args.public_key,
+        new_key_self_signature=args.new_key_signature,
+        registered_by=args.admin))
+    return 0
+
+
+def cmd_rotation_approve(args) -> int:
+    init_relay_db()
+    _print(trust.approve_rotation(
+        institution_code=args.institution, key_seq=args.key_seq,
+        approver=args.admin, request_key=args.request_key))
+    return 0
+
+
+def cmd_rotation_activate(args) -> int:
+    init_relay_db()
+    _print(trust.activate_rotation(
+        institution_code=args.institution, key_seq=args.key_seq,
+        request_key=args.request_key, actor=args.admin))
+    return 0
+
+
+def cmd_revoke(args) -> int:
+    init_relay_db()
+    _print(trust.publish_revocation(
+        institution_code=args.institution, request_key=args.request_key,
+        receipt_ids=args.receipt_ids or None, issued_from=args.from_time,
+        issued_to=args.to_time, reason=args.reason,
+        published_by=args.admin))
+    return 0
+
+
+def cmd_trust_export(args) -> int:
+    init_relay_db()
+    r = trust.export_trust_package(
+        institution_code=args.institution, request_key=args.request_key,
+        ttl_seconds=args.ttl, issued_by=args.admin)
+    Path(args.out).write_text(
+        json.dumps(r["package"], ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"{'重放' if r['replayed'] else '签发'}离线信任包 -> {args.out}")
+    return 0
+
+
+def cmd_trust_import(args) -> int:
+    init_relay_db()
+    package = json.loads(Path(args.file).read_text(encoding="utf-8"))
+    _print(trust.import_trust_package(
+        package, request_key=args.request_key, at=args.at))
+    return 0
+
+
+def cmd_status(args) -> int:
+    init_relay_db()
+    if args.receipt_id:
+        _print(trust.receipt_status(args.institution, args.receipt_id, args.at))
+    else:
+        _print(trust.institution_trust_status(args.institution))
+    return 0
+
+
+def cmd_trust_verify(args) -> int:
+    package = json.loads(Path(args.file).read_text(encoding="utf-8"))
+    try:
+        if verify_receipt_trust_type(package) == "trust":
+            report = verify_trust_package(package, now=args.at)
+        else:
+            trust_pkg = None
+            if args.trust:
+                trust_pkg = json.loads(
+                    Path(args.trust).read_text(encoding="utf-8"))
+            report = verify_receipt_package(
+                package, now=args.at, trust_package=trust_pkg)
+    except ReceiptError as exc:
+        _print({"valid": False, "code": exc.code, "message": str(exc),
+                "problems": exc.problems})
+        return 1
+    _print(report)
+    return 0
+
+
+def verify_receipt_trust_type(package: dict) -> str:
+    return package.get("body", {}).get("format") == "relay-trust/v1" \
+        and "trust" or "receipt"
+
 def cmd_recovery(args) -> int:
     """演示：同序号异内容 → 隔离 → 其他会话不受影响 → 修正 → 解除隔离 → 补齐。"""
     init_relay_db()
@@ -253,6 +363,65 @@ def main(argv=None) -> int:
 
     p_recov = sub.add_parser("recovery", help="隔离与恢复演示")
     p_recov.set_defaults(func=cmd_recovery)
+
+    def add_admin(p, key=True):
+        p.add_argument("--admin", default="admin-1")
+        if key:
+            p.add_argument("--request-key", required=True)
+
+    p_prev = sub.add_parser("rotation-preview", help="轮换预演")
+    p_prev.add_argument("--watermark", type=int, required=True)
+    p_prev.add_argument("--public-key")
+    p_prev.set_defaults(func=cmd_rotation_preview)
+
+    p_reg = sub.add_parser("rotation-register", help="幂等登记下一把公钥与生效水位")
+    add_admin(p_reg)
+    p_reg.add_argument("--watermark", type=int, required=True)
+    p_reg.add_argument("--public-key", help="留空则由本机生成下一把 Ed25519 钥")
+    p_reg.add_argument("--new-key-signature",
+                       help="外部公钥登记时，新私钥对登记声明的自签 hex")
+    p_reg.set_defaults(func=cmd_rotation_register)
+
+    p_app = sub.add_parser("rotation-approve", help="管理员批准已登记轮换")
+    add_admin(p_app)
+    p_app.add_argument("--key-seq", type=int, required=True)
+    p_app.set_defaults(func=cmd_rotation_approve)
+
+    p_act = sub.add_parser("rotation-activate", help="达到水位后显式生效/检查切换")
+    add_admin(p_act)
+    p_act.add_argument("--key-seq", type=int)
+    p_act.set_defaults(func=cmd_rotation_activate)
+
+    p_rev = sub.add_parser("revoke", help="按回执标识或签发时间区间发布撤销清单")
+    add_admin(p_rev)
+    p_rev.add_argument("--receipt-id", dest="receipt_ids", action="append")
+    p_rev.add_argument("--from-time")
+    p_rev.add_argument("--to-time")
+    p_rev.add_argument("--reason", default="REVOKED")
+    p_rev.set_defaults(func=cmd_revoke)
+
+    p_trust = sub.add_parser("trust-export", help="发布离线信任包")
+    add_admin(p_trust)
+    p_trust.add_argument("--ttl", type=int)
+    p_trust.add_argument("--out", required=True)
+    p_trust.set_defaults(func=cmd_trust_export)
+
+    p_import = sub.add_parser("trust-import", help="核验并导入离线信任包")
+    p_import.add_argument("file")
+    p_import.add_argument("--request-key")
+    p_import.add_argument("--at")
+    p_import.set_defaults(func=cmd_trust_import)
+
+    p_status = sub.add_parser("status", help="查看机构信任状态或单个回执状态")
+    p_status.add_argument("--receipt-id")
+    p_status.add_argument("--at")
+    p_status.set_defaults(func=cmd_status)
+
+    p_verify = sub.add_parser("offline-verify", help="离线核验回执或信任包")
+    p_verify.add_argument("file")
+    p_verify.add_argument("--trust", help="核验回执时附带的信任包 JSON")
+    p_verify.add_argument("--at")
+    p_verify.set_defaults(func=cmd_trust_verify)
 
     args = parser.parse_args(argv)
     return args.func(args)

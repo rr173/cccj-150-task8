@@ -32,6 +32,9 @@ def db_path() -> str:
 # 回执包默认有效期（秒）。过期回执不能再用于清理本地事件。
 RECEIPT_TTL_SECONDS = int(os.environ.get("RELAY_RECEIPT_TTL_SECONDS", str(7 * 86400)))
 
+# 离线信任包有效期（秒）。核验方必须在有效期内使用；过期时即使链和签名仍正确也拒绝。
+TRUST_TTL_SECONDS = int(os.environ.get("RELAY_TRUST_TTL_SECONDS", str(7 * 86400)))
+
 # 两个工作实例并发"领取"同一会话处理权的互斥租约（秒）。
 # 持久租约写进 SQLite；实例崩溃后，超过 TTL 的租约会被其他实例安全接管。
 LEASE_TTL_SECONDS = float(os.environ.get("RELAY_LEASE_TTL_SECONDS", "30"))

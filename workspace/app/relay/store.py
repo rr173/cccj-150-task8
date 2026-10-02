@@ -137,12 +137,122 @@ CREATE TABLE IF NOT EXISTS relay_receipt (
     signature       TEXT NOT NULL,
     issued_at       TEXT NOT NULL,
     expires_at      TEXT NOT NULL,
-    created_at      TEXT NOT NULL
+    created_at      TEXT NOT NULL,
+    receipt_serial  INTEGER,                 -- 机构内单调签发水位
+    signing_key_seq INTEGER,
+    signing_public_key TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_relay_receipt_sender
     ON relay_receipt(sender_id, institution_code);
 
--- 中继自身操作审计（推送批次/隔离/解除/导出/清理授权判定/租约领取）。
+-- 机构签发密钥轮换状态。根公钥 seq=0；current_key_seq 永远不回退。
+CREATE TABLE IF NOT EXISTS relay_institution_state (
+    institution_code TEXT PRIMARY KEY,
+    title            TEXT,
+    current_key_seq  INTEGER NOT NULL DEFAULT 0,
+    next_receipt_serial INTEGER NOT NULL DEFAULT 1,
+    revocation_version INTEGER NOT NULL DEFAULT 0,
+    revocation_digest TEXT,
+    trust_version    INTEGER NOT NULL DEFAULT 0,
+    previous_trust_digest TEXT,
+    last_trust_digest TEXT,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS relay_key_rotation (
+    institution_code TEXT NOT NULL,
+    key_seq          INTEGER NOT NULL,
+    public_key       TEXT NOT NULL,
+    effective_watermark INTEGER,
+    register_request_key TEXT NOT NULL,
+    registered_by    TEXT,
+    registered_at    TEXT NOT NULL,
+    status           TEXT NOT NULL,           -- PROPOSED / APPROVED / ACTIVE / REJECTED
+    approved_by      TEXT,
+    approved_at      TEXT,
+    activated_at     TEXT,
+    previous_record_hash TEXT,
+    record_hash      TEXT,
+    signature        TEXT,
+    new_key_self_signature TEXT,
+    PRIMARY KEY (institution_code, key_seq)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_relay_rot_register
+    ON relay_key_rotation(register_request_key);
+CREATE INDEX IF NOT EXISTS idx_relay_rot_active
+    ON relay_key_rotation(institution_code, status);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_relay_rot_open
+    ON relay_key_rotation(institution_code)
+    WHERE status IN ('PROPOSED','APPROVED');
+
+CREATE TABLE IF NOT EXISTS relay_admin_action (
+    request_key TEXT PRIMARY KEY,
+    institution_code TEXT NOT NULL,
+    action_type TEXT NOT NULL,                -- ROTATION_REGISTER/APPROVE/ACTIVATE/REVOKE/TRUST_EXPORT/TRUST_IMPORT
+    target_type TEXT,                         -- ROTATION/REVOCATION/TRUST
+    target_id TEXT,
+    fingerprint TEXT NOT NULL,
+    status_code INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS relay_revocation_list (
+    institution_code TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    entries_json TEXT NOT NULL,
+    entries_digest TEXT NOT NULL,
+    previous_list_hash TEXT,
+    list_hash TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    signing_key_seq INTEGER NOT NULL,
+    published_by TEXT,
+    published_at TEXT NOT NULL,
+    PRIMARY KEY (institution_code, version)
+);
+
+CREATE TABLE IF NOT EXISTS relay_revocation_entry (
+    institution_code TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    receipt_id TEXT,
+    receipt_serial INTEGER,
+    issued_from TEXT,
+    issued_to TEXT,
+    reason TEXT NOT NULL,
+    revoked_by TEXT,
+    revoked_at TEXT NOT NULL,
+    entry_json TEXT NOT NULL,
+    PRIMARY KEY (institution_code, version, receipt_id, receipt_serial,
+                 issued_from, issued_to, reason)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_rev_lookup
+    ON relay_revocation_entry(institution_code, receipt_id, receipt_serial,
+                              issued_from, issued_to);
+
+CREATE TABLE IF NOT EXISTS relay_trust_export (
+    request_key TEXT PRIMARY KEY,
+    institution_code TEXT NOT NULL,
+    trust_version INTEGER NOT NULL,
+    package_json TEXT NOT NULL,
+    trust_digest TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_relay_trust_version
+    ON relay_trust_export(institution_code, trust_version);
+
+CREATE TABLE IF NOT EXISTS relay_trust_import (
+    institution_code TEXT PRIMARY KEY,
+    trust_version INTEGER NOT NULL,
+    trust_digest TEXT NOT NULL,
+    previous_trust_digest TEXT,
+    package_json TEXT NOT NULL,
+    imported_at TEXT NOT NULL
+);
+
+-- 中继自身操作审计（推送批次/隔离/解除/导出/清理授权判定/租约领取/轮换/撤销/信任导入）。
 CREATE TABLE IF NOT EXISTS relay_audit (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     action      TEXT NOT NULL,
@@ -159,6 +269,21 @@ def init_relay_db():
     conn = get_conn()
     try:
         conn.executescript(SCHEMA)
+        rot_cols = {r[1] for r in conn.execute("PRAGMA table_info(relay_key_rotation)")}
+        if rot_cols and "new_key_self_signature" not in rot_cols:
+            conn.execute(
+                "ALTER TABLE relay_key_rotation ADD COLUMN new_key_self_signature TEXT")
+        conn.execute("DROP INDEX IF EXISTS uq_relay_rot_active")
+        rcols = {r[1] for r in conn.execute("PRAGMA table_info(relay_receipt)")}
+        for col, ddl in (
+                ("receipt_serial",
+                 "ALTER TABLE relay_receipt ADD COLUMN receipt_serial INTEGER"),
+                ("signing_key_seq",
+                 "ALTER TABLE relay_receipt ADD COLUMN signing_key_seq INTEGER"),
+                ("signing_public_key",
+                 "ALTER TABLE relay_receipt ADD COLUMN signing_public_key TEXT")):
+            if rcols and col not in rcols:
+                conn.execute(ddl)
         conn.commit()
     finally:
         conn.close()
